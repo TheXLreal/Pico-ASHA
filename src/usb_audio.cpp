@@ -39,6 +39,7 @@
 
 #include "usb_descriptors.h"
 #include "usb_common.hpp"
+#include "audio_stall_trace.h"
 
 #include "asha_audio.h"
 #include "asha_comms.hpp"
@@ -564,7 +565,15 @@ void audio_task(void)
       asha_audio_encode_1ms_pcm(spk_buf, s == spk_data_size_16 ? 16u : 48u);
     }
   } else {
-    if (absolute_time_diff_us(last_packet_time, now) > 5000) {
+    int64_t packet_gap_us = absolute_time_diff_us(last_packet_time, now);
+    if (packet_gap_us > 5000) {
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+      if (asha_audio_get_pcm_streaming_enabled()) {
+        audio_stall_trace_usb_pcm_underrun(
+            packet_gap_us > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(packet_gap_us),
+            asha_audio_get_write_index());
+      }
+#endif
       asha_audio_set_pcm_streaming_enabled(false);
       last_packet_time = now;
     }

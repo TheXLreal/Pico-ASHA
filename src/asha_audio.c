@@ -12,6 +12,7 @@
 
 #include "asha_audio.h"
 #include "asha_audio_coefficients.h"
+#include "audio_stall_trace.h"
 
 
 #define ASHA_BLOCK_SIZE 48
@@ -74,6 +75,9 @@ static void reset_decimators()
 
 void asha_audio_init()
 {
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    audio_stall_trace_init();
+#endif
     memset(enc_ring_buff, 0, sizeof(enc_ring_buff));
     pcm_streaming = false;
     encode_audio = false;
@@ -152,12 +156,18 @@ void asha_audio_encode_1ms_pcm(struct PCMStereoSample *samples, uint16_t count)
     ++enc_time_index;
 #endif
     if (g_offset >= ASHA_SDU_SIZE_BYTES) {
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+        uint8_t completed_sequence = seq_num;
+#endif
         buff->l[0] = seq_num;
         buff->r[0] = seq_num;
         ++seq_num;
         g_offset = 1;
         write_index += 1;
         enc_time_index = 0;
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+        audio_stall_trace_sdu_generated(completed_sequence, w_index + 1u);
+#endif
     }
 }
 

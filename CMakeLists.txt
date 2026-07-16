@@ -43,6 +43,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(ENABLE_AUDIO_ENC_STATS "Enable audio downsampling and encoding statistics" OFF)
+option(ENABLE_AUDIO_STALL_TRACE "Enable binary ASHA audio stall diagnostics" OFF)
+option(ENABLE_AUDIO_STALL_TRACE_RSSI "Sample connected-device RSSI for audio stall diagnostics" OFF)
+
+if (ENABLE_AUDIO_STALL_TRACE_RSSI AND NOT ENABLE_AUDIO_STALL_TRACE)
+  message(FATAL_ERROR "ENABLE_AUDIO_STALL_TRACE_RSSI requires ENABLE_AUDIO_STALL_TRACE")
+endif()
 
 # Drop data immediately when the CDC TX buffer is full rather than stalling
 # core 1; DEADLOCK_TIMEOUT caps the mutex-wait as a secondary safety net.
@@ -74,6 +80,7 @@ set(ASHA_SRC
   src/main.cpp
   src/runtime_settings.cpp
   src/asha_audio.c
+  src/audio_stall_trace.c
   src/asha_bt.cpp
   src/asha_comms.cpp
   src/asha_led.cpp
@@ -95,6 +102,14 @@ target_include_directories(pico_asha PUBLIC src/ lib/ include/)
 if (ENABLE_AUDIO_ENC_STATS)
   list(APPEND pico_asha_defines "PICO_ASHA_ENC_STATS=1")
 endif(ENABLE_AUDIO_ENC_STATS)
+
+if (ENABLE_AUDIO_STALL_TRACE)
+  list(APPEND pico_asha_defines "PICO_ASHA_AUDIO_STALL_TRACE=1")
+endif()
+
+if (ENABLE_AUDIO_STALL_TRACE_RSSI)
+  list(APPEND pico_asha_defines "PICO_ASHA_AUDIO_STALL_TRACE_RSSI=1")
+endif()
 
 list(APPEND pico_asha_defines "PICO_ASHA_FW_VERS_MAJOR=${CMAKE_PROJECT_VERSION_MAJOR}")
 list(APPEND pico_asha_defines "PICO_ASHA_FW_VERS_MINOR=${CMAKE_PROJECT_VERSION_MINOR}")

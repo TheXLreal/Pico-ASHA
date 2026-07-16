@@ -7,6 +7,7 @@
 #include <etl/string.h>
 
 #include "asha_audio.h"
+#include "audio_stall_trace.h"
 #include "asha_bt.hpp"
 #include "asha_comms.hpp"
 
@@ -132,8 +133,14 @@ struct HearingAid
     static void start_scan();
     static void on_ad_report(const AdvertisingReport& report);
     static void connect(const bd_addr_t addr, bd_addr_type_t addr_type);
-    static void on_connected(bd_addr_t addr, hci_con_handle_t handle);
+    static void on_connected(bd_addr_t addr, hci_con_handle_t handle,
+                             uint16_t connection_interval, uint16_t peripheral_latency,
+                             uint16_t supervision_timeout);
     static void on_disconnected(hci_con_handle_t handle, uint8_t status, uint8_t reason);
+    static void on_connection_parameters_updated(hci_con_handle_t handle,
+                                                 uint16_t connection_interval,
+                                                 uint16_t peripheral_latency,
+                                                 uint16_t supervision_timeout);
     static void on_data_len_set(hci_con_handle_t handle, uint16_t rx_octets, uint16_t rx_time, uint16_t tx_octets, uint16_t tx_time);
     static void delete_pair();
     static void delete_pair(uint16_t conn_id);
@@ -146,6 +153,10 @@ struct HearingAid
     static void handle_notification_reg(PACKET_HANDLER_PARAMS);
     static void handle_gatt_notification(PACKET_HANDLER_PARAMS);
     static bool process_audio();
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE_RSSI
+    static void sample_rssi();
+    static void on_rssi(hci_con_handle_t handle, int8_t rssi);
+#endif
 
 private:
     /* GATT structures */
@@ -225,6 +236,20 @@ private:
     bool first_audio_send = false;
     uint8_t* audio_data = nullptr;
 
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    uint64_t trace_can_send_request_us = 0U;
+    uint64_t trace_l2cap_send_us = 0U;
+    uint64_t trace_audio_busy_since_us = 0U;
+    uint64_t trace_last_successful_send_us = 0U;
+    uint16_t trace_connection_interval = 0U;
+    uint16_t trace_peripheral_latency = 0U;
+    uint16_t trace_supervision_timeout = 0U;
+    uint8_t trace_pending_sequence = AUDIO_STALL_TRACE_INVALID_SEQUENCE;
+    uint8_t trace_last_sequence = AUDIO_STALL_TRACE_INVALID_SEQUENCE;
+    bool trace_busy_stall_reported = false;
+    bool trace_ring_underrun_reported = false;
+#endif
+
     bool stop_request_from_other = false;
 
     std::array<uint8_t, ASHA_SDU_SIZE_BYTES> recv_buff = {};
@@ -249,8 +274,9 @@ private:
     bool is_streaming();
     void set_process_busy();
     void unset_process_busy();
-    void set_audio_busy();
-    void unset_audio_busy();
+    void set_audio_busy(uint8_t sequence = AUDIO_STALL_TRACE_INVALID_SEQUENCE,
+                        int32_t context = 0);
+    void unset_audio_busy(int32_t context = 0);
     void set_data_langth();
     void send_acp_start();
     void send_acp_stop();

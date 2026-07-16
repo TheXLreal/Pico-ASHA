@@ -374,6 +374,9 @@ void PicoAshaComm::handleDecodedData(QByteArray const& decoded)
         memcpy(&ad, decoded.constData() + sizeof header, sizeof ad);
         m_ui->onAdPacketReceived(ad);
         break;
+    case Type::AudioTrace:
+        // Binary diagnostics are intentionally not rendered as per-packet text.
+        break;
     }
 }
 

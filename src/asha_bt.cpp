@@ -7,6 +7,7 @@
 
 #include "asha_bt.hpp"
 #include "asha_comms.hpp"
+#include "audio_stall_trace.h"
 #include "asha_uuid.hpp"
 #include "hearing_aid.hpp"
 #include "util.hpp"
@@ -204,6 +205,10 @@ static void process_serial_cmds()
 
 static void audio_timer_handler(btstack_timer_source_t* timer)
 {
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    uint64_t trace_now_us = audio_stall_trace_now_us();
+    audio_stall_trace_audio_timer_tick(trace_now_us);
+#endif
     btstack_run_loop_set_timer(timer, ha_audio_interval_ms);
     btstack_run_loop_add_timer(timer);
 
@@ -231,7 +236,19 @@ static void audio_timer_handler(btstack_timer_source_t* timer)
     if (usb_serial_is_connected) {
         comm::try_send_events();
     }
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    if (stdio_usb_connected()) {
+        comm::try_send_audio_trace();
+    }
+#endif
     HearingAid::process();
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE_RSSI
+    static uint64_t last_rssi_sample_us = 0U;
+    if (trace_now_us - last_rssi_sample_us >= 500000U) {
+        last_rssi_sample_us = trace_now_us;
+        HearingAid::sample_rssi();
+    }
+#endif
 }
 
 static void auto_pair_timer_handler([[maybe_unused]] btstack_timer_source_t * timer)
@@ -309,7 +326,11 @@ static void hci_event_handler(PACKET_HANDLER_PARAMS)
                 hci_con_handle_t handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
                 bd_addr_t addr = {};
                 gap_subevent_le_connection_complete_get_peer_address(packet, addr);
-                HearingAid::on_connected(addr, handle);
+                HearingAid::on_connected(
+                    addr, handle,
+                    gap_subevent_le_connection_complete_get_conn_interval(packet),
+                    gap_subevent_le_connection_complete_get_conn_latency(packet),
+                    gap_subevent_le_connection_complete_get_supervision_timeout(packet));
             }
             break;
         case HCI_EVENT_LE_META:
@@ -320,8 +341,21 @@ static void hci_event_handler(PACKET_HANDLER_PARAMS)
                 uint16_t tx_octets = hci_subevent_le_data_length_change_get_max_tx_octets(packet);
                 uint16_t tx_time = hci_subevent_le_data_length_change_get_max_tx_time(packet);
                 HearingAid::on_data_len_set(handle, rx_octets, rx_time, tx_octets, tx_time);
+            } else if (hci_event_le_meta_get_subevent_code(packet) ==
+                       HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE) {
+                HearingAid::on_connection_parameters_updated(
+                    hci_subevent_le_connection_update_complete_get_connection_handle(packet),
+                    hci_subevent_le_connection_update_complete_get_conn_interval(packet),
+                    hci_subevent_le_connection_update_complete_get_conn_latency(packet),
+                    hci_subevent_le_connection_update_complete_get_supervision_timeout(packet));
             }
             break;
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE_RSSI
+        case GAP_EVENT_RSSI_MEASUREMENT:
+            HearingAid::on_rssi(gap_event_rssi_measurement_get_con_handle(packet),
+                                static_cast<int8_t>(gap_event_rssi_measurement_get_rssi(packet)));
+            break;
+#endif
         case HCI_EVENT_DISCONNECTION_COMPLETE:
         {
             hci_con_handle_t handle = hci_event_disconnection_complete_get_connection_handle(packet);

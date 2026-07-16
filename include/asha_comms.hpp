@@ -30,6 +30,7 @@ namespace comm
         Cmd,
         Advert,
         USBInfo,
+        AudioTrace,
     };
 
     enum class StatusType : uint8_t
@@ -280,6 +281,9 @@ namespace comm
     }
 
     void try_send_events();
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    void try_send_audio_trace();
+#endif
 
     void send_intro_packet(int8_t num_connections, uint16_t flags = 0x00);
     void send_usb_info_packet(USBInfo const& usb_info);

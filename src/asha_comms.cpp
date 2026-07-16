@@ -11,6 +11,7 @@
 
 #include "asha_comms.hpp"
 #include "asha_vers.h"
+#include "audio_stall_trace.h"
 
 namespace asha
 {
@@ -57,6 +58,19 @@ namespace comm
     static_assert(cobs_hci_buff_size <= COBS_TINYFRAME_SAFE_BUFFER_SIZE);
 
     static uint8_t cobs_enc_buff[COBS_TINYFRAME_SAFE_BUFFER_SIZE];
+
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    constexpr size_t trace_records_per_packet = 5;
+    constexpr size_t max_trace_decoded_size = sizeof(HeaderPacket) +
+                                              sizeof(AudioStallTracePacketHeader) +
+                                              trace_records_per_packet * sizeof(AudioStallTraceRecord);
+    static_assert(zero_prefix + COBS_ENCODE_MAX(max_trace_decoded_size) <=
+                  COBS_TINYFRAME_SAFE_BUFFER_SIZE);
+    static uint8_t trace_cobs_enc_buff[COBS_TINYFRAME_SAFE_BUFFER_SIZE];
+    static std::array<AudioStallTraceRecord, trace_records_per_packet> pending_trace_records;
+    static uint8_t pending_trace_record_count = 0;
+    static uint64_t last_trace_snapshot_us = 0;
+#endif
 
     static etl::circular_buffer<std::array<uint8_t, cobs_ev_buff_size>, 200> event_buff;
 
@@ -120,6 +134,81 @@ namespace comm
             stdio_flush();
         }
     }
+
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    static bool send_audio_trace_payload(uint8_t kind, uint8_t count,
+                                         const void *payload, uint8_t payload_size,
+                                         uint64_t now_us)
+    {
+        AudioStallTracePacketHeader trace_header = {
+            .magic = AUDIO_STALL_TRACE_MAGIC,
+            .version = AUDIO_STALL_TRACE_VERSION,
+            .kind = kind,
+            .count = count,
+            .payload_size = payload_size,
+        };
+        const size_t decoded_size = sizeof(HeaderPacket) + sizeof(trace_header) + payload_size;
+        if (decoded_size > UINT8_MAX) return false;
+        HeaderPacket header = {
+            .type = Type::AudioTrace,
+            .len = static_cast<uint8_t>(decoded_size),
+            .conn_id = unset_conn_id,
+            .ts_ms = static_cast<uint32_t>(now_us / 1000U),
+        };
+
+        trace_cobs_enc_buff[0] = 0;
+        cobs_enc_ctx_t enc_ctx = {};
+        size_t enc_len = 0;
+        if (cobs_encode_inc_begin(trace_cobs_enc_buff + zero_prefix,
+                                  sizeof(trace_cobs_enc_buff) - zero_prefix,
+                                  &enc_ctx) != COBS_RET_SUCCESS ||
+            cobs_encode_inc(&enc_ctx, &header, sizeof(header)) != COBS_RET_SUCCESS ||
+            cobs_encode_inc(&enc_ctx, &trace_header, sizeof(trace_header)) != COBS_RET_SUCCESS ||
+            cobs_encode_inc(&enc_ctx, payload, payload_size) != COBS_RET_SUCCESS ||
+            cobs_encode_inc_end(&enc_ctx, &enc_len) != COBS_RET_SUCCESS) {
+            return false;
+        }
+
+        uint32_t total = static_cast<uint32_t>(enc_len + zero_prefix);
+        if (tud_cdc_write_available() < total) return false;
+        if (tud_cdc_write(trace_cobs_enc_buff, total) != total) return false;
+        tud_cdc_write_flush();
+        return true;
+    }
+
+    void try_send_audio_trace()
+    {
+        if (!stdio_usb_connected()) return;
+        uint64_t now_us = audio_stall_trace_now_us();
+
+        if (last_trace_snapshot_us == 0U ||
+            now_us - last_trace_snapshot_us >= AUDIO_STALL_TRACE_SNAPSHOT_INTERVAL_US) {
+            AudioStallTraceSnapshot snapshot = {};
+            audio_stall_trace_snapshot(&snapshot, now_us);
+            if (!send_audio_trace_payload(AUDIO_STALL_TRACE_PAYLOAD_SNAPSHOT, 1U,
+                                          &snapshot, sizeof(snapshot), now_us)) {
+                return;
+            }
+            last_trace_snapshot_us = now_us;
+        }
+
+        if (pending_trace_record_count == 0U) {
+            while (pending_trace_record_count < pending_trace_records.size() &&
+                   audio_stall_trace_pop(&pending_trace_records[pending_trace_record_count])) {
+                ++pending_trace_record_count;
+            }
+        }
+        if (pending_trace_record_count == 0U) return;
+
+        uint8_t payload_size = static_cast<uint8_t>(pending_trace_record_count *
+                                                    sizeof(AudioStallTraceRecord));
+        if (send_audio_trace_payload(AUDIO_STALL_TRACE_PAYLOAD_RECORDS,
+                                     pending_trace_record_count,
+                                     pending_trace_records.data(), payload_size, now_us)) {
+            pending_trace_record_count = 0U;
+        }
+    }
+#endif
 
     void send_intro_packet(int8_t num_connections, uint16_t flags)
     {

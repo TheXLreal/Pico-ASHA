@@ -1,0 +1,165 @@
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define AUDIO_STALL_TRACE_MAGIC 0x52545341u /* "ASTR" in little endian */
+#define AUDIO_STALL_TRACE_VERSION 1u
+#define AUDIO_STALL_TRACE_INVALID_SEQUENCE 0xffu
+#define AUDIO_STALL_TRACE_INVALID_HANDLE 0xffffu
+#define AUDIO_STALL_TRACE_SNAPSHOT_INTERVAL_US 250000u
+#define AUDIO_STALL_TRACE_ANOMALY_US 25000u
+
+enum AudioStallTraceEvent {
+    AUDIO_STALL_TRACE_SDU_GENERATED = 1,
+    AUDIO_STALL_TRACE_CAN_SEND_REQUESTED,
+    AUDIO_STALL_TRACE_CAN_SEND_NOW,
+    AUDIO_STALL_TRACE_L2CAP_SEND,
+    AUDIO_STALL_TRACE_PACKET_SENT,
+    AUDIO_STALL_TRACE_BUSY_SET,
+    AUDIO_STALL_TRACE_BUSY_CLEAR,
+    AUDIO_STALL_TRACE_RING_UNDERRUN,
+    AUDIO_STALL_TRACE_RING_OVERRUN,
+    AUDIO_STALL_TRACE_BLE_DISCONNECT,
+    AUDIO_STALL_TRACE_BLE_CONNECT,
+    AUDIO_STALL_TRACE_BUSY_STALL,
+    AUDIO_STALL_TRACE_AUDIO_TIMER_LATE,
+    AUDIO_STALL_TRACE_USB_PCM_UNDERRUN,
+    AUDIO_STALL_TRACE_RSSI_SAMPLE,
+};
+
+enum AudioStallTracePayloadKind {
+    AUDIO_STALL_TRACE_PAYLOAD_RECORDS = 1,
+    AUDIO_STALL_TRACE_PAYLOAD_SNAPSHOT,
+};
+
+enum AudioStallTraceBusyContext {
+    AUDIO_STALL_TRACE_BUSY_CONTEXT_ACP_START = 1,
+    AUDIO_STALL_TRACE_BUSY_CONTEXT_AUDIO_SDU,
+    AUDIO_STALL_TRACE_BUSY_CONTEXT_PACKET_SENT,
+    AUDIO_STALL_TRACE_BUSY_CONTEXT_RESET,
+};
+
+/*
+ * Fixed wire record. All fields are little endian. Event-specific meanings:
+ * - duration_us: generation interval, CAN_SEND wait, send-to-packet wait, or
+ *   audio_busy duration.
+ * - detail0/detail1: SDU size; connect interval/latency/timeout; or the age
+ *   and low 32 bits of the last successful send at disconnect.
+ * - result: BTstack result/status, packed disconnect status/reason, busy
+ *   context, or signed RSSI.
+ */
+typedef struct __attribute__((packed, aligned(4))) AudioStallTraceRecord {
+    uint64_t timestamp_us;
+    uint32_t write_index;
+    uint32_t read_index;
+    uint32_t duration_us;
+    uint32_t detail0;
+    uint32_t detail1;
+    int32_t result;
+    uint16_t connection_handle;
+    uint16_t l2cap_cid;
+    uint8_t event_type;
+    uint8_t sequence;
+    uint8_t ring_fill;
+    uint8_t audio_busy;
+} AudioStallTraceRecord;
+
+typedef struct __attribute__((packed, aligned(4))) AudioStallTracePacketHeader {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t kind;
+    uint8_t count;
+    uint8_t payload_size;
+} AudioStallTracePacketHeader;
+
+typedef struct __attribute__((packed, aligned(4))) AudioStallTraceSnapshot {
+    uint64_t timestamp_us;
+    uint32_t sdu_generated_count;
+    uint32_t l2cap_send_attempt_count;
+    uint32_t l2cap_send_success_count;
+    uint32_t l2cap_send_error_count;
+    uint32_t can_send_wait_last_us;
+    uint32_t can_send_wait_max_us;
+    uint32_t packet_sent_wait_max_us;
+    uint32_t audio_busy_current_duration_us;
+    uint32_t audio_busy_max_duration_us;
+    uint32_t ring_fill_current;
+    uint32_t ring_fill_min;
+    uint32_t ring_fill_max;
+    uint32_t ring_underrun_count;
+    uint32_t ring_overrun_count;
+    uint32_t sequence_generated;
+    uint32_t sequence_sent;
+    uint32_t sequence_skip_count;
+    uint32_t audio_timer_gap_max_us;
+    uint32_t audio_timer_late_count;
+    uint32_t usb_pcm_underrun_count;
+    uint32_t trace_dropped;
+} AudioStallTraceSnapshot;
+
+#if defined(__cplusplus)
+static_assert(sizeof(AudioStallTraceRecord) == 40);
+static_assert(sizeof(AudioStallTracePacketHeader) == 8);
+static_assert(sizeof(AudioStallTraceSnapshot) == 92);
+#else
+_Static_assert(sizeof(AudioStallTraceRecord) == 40, "Unexpected trace record size");
+_Static_assert(sizeof(AudioStallTracePacketHeader) == 8, "Unexpected trace header size");
+_Static_assert(sizeof(AudioStallTraceSnapshot) == 92, "Unexpected trace snapshot size");
+#endif
+
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+
+void audio_stall_trace_init(void);
+uint64_t audio_stall_trace_now_us(void);
+void audio_stall_trace_set_consumer(uint8_t slot, bool active, uint32_t read_index);
+uint32_t audio_stall_trace_sdu_age_us(uint64_t now_us);
+
+void audio_stall_trace_sdu_generated(uint8_t sequence, uint32_t write_index);
+void audio_stall_trace_can_send_requested(uint16_t handle, uint16_t cid, uint8_t sequence,
+                                          uint32_t write_index, uint32_t read_index, bool busy);
+void audio_stall_trace_can_send_now(uint16_t handle, uint16_t cid, uint8_t sequence,
+                                    uint32_t write_index, uint32_t read_index, bool busy,
+                                    uint32_t wait_us);
+void audio_stall_trace_l2cap_send(uint16_t handle, uint16_t cid, uint8_t sequence,
+                                  uint32_t write_index, uint32_t read_index, bool busy,
+                                  uint16_t sdu_size, int32_t result);
+void audio_stall_trace_packet_sent(uint16_t handle, uint16_t cid, uint8_t sequence,
+                                   uint32_t write_index, uint32_t read_index, bool busy,
+                                   uint32_t wait_us);
+void audio_stall_trace_busy(uint8_t event_type, uint16_t handle, uint16_t cid, uint8_t sequence,
+                            uint32_t write_index, uint32_t read_index, bool busy,
+                            uint32_t duration_us, int32_t context);
+void audio_stall_trace_ring_underrun(uint16_t handle, uint16_t cid, uint8_t sequence,
+                                     uint32_t write_index, uint32_t read_index, bool busy,
+                                     uint32_t empty_duration_us);
+void audio_stall_trace_ble_disconnect(uint16_t handle, uint16_t cid, uint8_t sequence,
+                                      uint32_t write_index, uint32_t read_index, bool busy,
+                                      uint8_t status, uint8_t reason, uint32_t busy_duration_us,
+                                      uint64_t last_successful_send_us);
+void audio_stall_trace_ble_connect(uint16_t handle, uint16_t cid, uint8_t sequence,
+                                   uint32_t write_index, uint32_t read_index, bool busy,
+                                   uint16_t interval, uint16_t latency,
+                                   uint16_t supervision_timeout);
+void audio_stall_trace_audio_timer_tick(uint64_t now_us);
+void audio_stall_trace_usb_pcm_underrun(uint32_t gap_us, uint32_t write_index);
+void audio_stall_trace_rssi(uint16_t handle, uint16_t cid, uint8_t sequence,
+                            uint32_t write_index, uint32_t read_index, bool busy, int8_t rssi);
+
+bool audio_stall_trace_pop(AudioStallTraceRecord *record);
+void audio_stall_trace_snapshot(AudioStallTraceSnapshot *snapshot, uint64_t now_us);
+
+#else
+
+static inline void audio_stall_trace_init(void) {}
+
+#endif
+
+#ifdef __cplusplus
+}
+#endif
