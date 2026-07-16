@@ -243,10 +243,8 @@ namespace comm
         }
 
         uint32_t total = static_cast<uint32_t>(enc_len + zero_prefix);
-        if (tud_cdc_write_available() < total) return false;
-        if (tud_cdc_write(trace_cobs_enc_buff, total) != total) return false;
-        tud_cdc_write_flush();
-        return true;
+        return enqueue_usb_packet(trace_cobs_enc_buff,
+                                  static_cast<uint16_t>(total));
     }
 
     void try_send_audio_trace()

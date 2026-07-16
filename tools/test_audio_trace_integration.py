@@ -21,26 +21,69 @@ def function_body(source: str, signature: str) -> str:
 
 
 class AudioTraceIntegrationTest(unittest.TestCase):
-    def test_usb_main_regular_loop_polls_trace(self):
-        source = (ROOT / "src" / "usb_audio.cpp").read_text(encoding="utf-8")
-        body = function_body(source, "void usb_main(void)")
-        loop = function_body(body, "while (1)")
+    def test_btstack_run_loop_regularly_queues_trace(self):
+        bt_source = (ROOT / "src" / "asha_bt.cpp").read_text(encoding="utf-8")
+        timer = function_body(
+            bt_source, "static void audio_timer_handler(btstack_timer_source_t* timer)"
+        )
 
-        self.assertIn("tud_task();", loop)
         self.assertRegex(
-            loop,
+            timer,
             re.compile(
-                r"#ifdef\s+PICO_ASHA_AUDIO_STALL_TRACE\s+"
+                r"#ifdef\s+PICO_ASHA_AUDIO_STALL_TRACE[\s\S]*?"
                 r"comm::try_send_audio_trace\(\);\s+#endif",
                 re.MULTILINE,
             ),
         )
+        # The poll happens on every run-loop tick, before audio/Nucleus state
+        # can take one of the early-return paths.
+        self.assertLess(
+            timer.index("comm::try_send_audio_trace();"),
+            timer.index("HearingAid::process_audio()"),
+        )
+
+        usb_source = (ROOT / "src" / "usb_audio.cpp").read_text(encoding="utf-8")
+        usb_body = function_body(usb_source, "void usb_main(void)")
+        loop = function_body(usb_body, "while (1)")
+        self.assertIn("tud_task();", loop)
         self.assertIn("comm::try_send_usb_packets();", loop)
+        self.assertNotIn("try_send_audio_trace", loop)
+
+        cpp_sources = "\n".join(
+            path.read_text(encoding="utf-8") for path in (ROOT / "src").glob("*.cpp")
+        )
+        self.assertEqual(1, cpp_sources.count("comm::try_send_audio_trace();"))
+
+    def test_trace_payload_uses_single_usb_tx_path(self):
+        source = (ROOT / "src" / "asha_comms.cpp").read_text(encoding="utf-8")
+        trace_send = function_body(source, "static bool send_audio_trace_payload")
+        usb_send = function_body(source, "void try_send_usb_packets")
+
+        self.assertIn("enqueue_usb_packet", trace_send)
+        self.assertNotIn("tud_cdc_write", trace_send)
+        self.assertIn("tud_cdc_write", usb_send)
+
+    def test_snapshot_period_is_250_ms_without_nucleus_dependency(self):
+        header = (ROOT / "src" / "audio_stall_trace.h").read_text(encoding="utf-8")
+        source = (ROOT / "src" / "asha_comms.cpp").read_text(encoding="utf-8")
+        poll = function_body(source, "void try_send_audio_trace")
+
+        self.assertRegex(
+            header,
+            re.compile(
+                r"#define\s+AUDIO_STALL_TRACE_SNAPSHOT_INTERVAL_US\s+250000u"
+            ),
+        )
+        self.assertIn("AUDIO_STALL_TRACE_SNAPSHOT_INTERVAL_US", poll)
+        self.assertNotIn("HearingAid", poll)
+        self.assertNotIn("nucleus", poll.lower())
 
     def test_trace_enabled_bt_paths_do_not_write_tinyusb(self):
         bt_source = (ROOT / "src" / "asha_bt.cpp").read_text(encoding="utf-8")
-        timer = function_body(bt_source, "static void audio_timer_handler")
-        self.assertNotIn("try_send_audio_trace", timer)
+        timer = function_body(
+            bt_source, "static void audio_timer_handler(btstack_timer_source_t* timer)"
+        )
+        self.assertIn("try_send_audio_trace", timer)
         self.assertNotIn("tud_cdc_write", timer)
 
         comms_source = (ROOT / "src" / "asha_comms.cpp").read_text(encoding="utf-8")

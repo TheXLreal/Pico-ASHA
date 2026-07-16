@@ -212,6 +212,12 @@ static void audio_timer_handler(btstack_timer_source_t* timer)
     btstack_run_loop_set_timer(timer, ha_audio_interval_ms);
     btstack_run_loop_add_timer(timer);
 
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    // BTstack core 1 is the sole producer of the USB TX queue. Trace packet
+    // construction only enqueues here; usb_main() owns all TinyUSB writes.
+    comm::try_send_audio_trace();
+#endif
+
     // First process audio
     if (HearingAid::process_audio()) {
         // if audio is sent to HA, delay other processing
