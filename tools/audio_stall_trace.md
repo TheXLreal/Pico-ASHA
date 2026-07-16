@@ -4,7 +4,8 @@ The diagnostics are off by default. Build a Pico 2 W image with:
 
 ```powershell
 cmake -S . -B build/firmware-pico2_w -DPICO_BOARD=pico2_w `
-  -DENABLE_AUDIO_STALL_TRACE=ON
+  -DENABLE_AUDIO_STALL_TRACE=ON `
+  -DENABLE_AUDIO_STALL_TRACE_RSSI=ON
 cmake --build build/firmware-pico2_w
 ```
 
@@ -42,5 +43,24 @@ captured before the interruption. An incomplete trailing frame is ignored.
 
 The parser writes event, aggregate-snapshot, per-sequence timeline, and
 five-seconds-before-disconnect CSV files. Durations above 25 ms, timer gaps
-above 2 ms, L2CAP errors, ring underruns/overruns, and disconnects are marked
+above 5 ms, L2CAP errors, ring underruns/overruns, and disconnects are marked
 as anomalies.
+
+Trace version 1 keeps the original 40-byte record and 92-byte snapshot wire
+layouts. Runtime diagnostics are sent as optional payload kind 3 and merged by
+the parser with the snapshot at the same timestamp. Its fields are:
+
+- `hci_write_count`, `hci_write_error_count`, `hci_write_last_us`,
+  `hci_write_max_us`;
+- `cyw43_lock_wait_last_us`, `cyw43_lock_wait_max_us`,
+  `cyw43_lock_hold_last_us`, `cyw43_lock_hold_max_us`;
+- `btstack_run_loop_gap_last_us`, `btstack_run_loop_gap_max_us`;
+- `hci_to_packet_sent_last_us`, `hci_to_packet_sent_max_us`;
+- RSSI values/ages, sample and skipped-request counts;
+- stale-SDU drop count and dropped-frame count.
+
+Event IDs 19-25 are `AUDIO_TX_STALE_DROP`, `HCI_WRITE_BEGIN`,
+`HCI_WRITE_END`, `CYW43_LOCK_WAIT_BEGIN`, `CYW43_LOCK_ACQUIRED`,
+`CYW43_LOCK_HELD`, and `RSSI_CONTEXT`. Begin/end and lock events are emitted
+only for slow operations; normal calls update aggregates without filling the
+trace ring.

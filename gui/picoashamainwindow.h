@@ -40,6 +40,8 @@ public:
     void setUSBWidgetsEnabled(bool enabled);
 
     void setPicoAshaVerStr(QString const& version);
+    void setBLEConnectionState(asha::comm::BLEConnectionState state);
+    void setRestartButtonEnabled(bool enabled);
     void setConnectionsAllowed(bool allowed);
     void setAudioStreamingEnabled(bool enabled);
     void setUSBInfo(asha::comm::USBInfo const& usb_info);
@@ -70,6 +72,7 @@ private:
     QFrame* m_remoteFrame;
     QPlainTextEdit* m_logWidget;
     QLabel* m_serialConnectedStatus;
+    QLabel* m_bleConnectionStatus;
     QLabel* m_encodeTimesLabel;
     QList<int16_t> m_encodeTimes;
     QList<RemoteDevice*> m_remotes;
@@ -90,9 +93,9 @@ private:
 
     PairDialog* m_currPairDlg;
 
-    bool m_serialConnected;
-    bool m_connectionsAllowed;
-    bool m_streamingEnabled;
+    bool m_serialConnected = false;
+    bool m_connectionsAllowed = false;
+    bool m_streamingEnabled = false;
 
     asha::comm::USBInfo m_usbInfo;
     asha::comm::USBInfo fromUsbWidgets();

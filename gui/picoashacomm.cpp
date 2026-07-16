@@ -197,6 +197,9 @@ void PicoAshaComm::onHciLogActionBtnClicked()
 void PicoAshaComm::onCmdRestartBtnClicked()
 {
     using namespace asha::comm;
+    // This is the only GUI path that may send Restart. It is deliberately tied
+    // to an explicit user action, never to a BLE disconnect/recovery event.
+    if (m_manualRestartPending) return;
     bool res = sendCommandPacket(
         {
             .cmd = Command::Restart,
@@ -205,6 +208,8 @@ void PicoAshaComm::onCmdRestartBtnClicked()
         }
         );
     if (res) {
+        m_manualRestartPending = true;
+        m_ui->setRestartButtonEnabled(false);
         m_ui->onSerialConnected(false);
     }
 }
@@ -331,6 +336,9 @@ void PicoAshaComm::handleDecodedData(QByteArray const& decoded)
         m_ui->setPicoAshaVerStr(paFirmwareVers());
         m_ui->setConnectionsAllowed(intro.test_flag(IntroFlags::conn_allowed));
         m_ui->setAudioStreamingEnabled(intro.test_flag(IntroFlags::streaming_enabled));
+        m_firmwareManagedReconnect = intro.test_flag(
+            IntroFlags::firmware_managed_reconnect);
+        m_manualRestartPending = false;
         m_ui->setCmdBtnsEnabled(true);
         break;
     }
@@ -410,6 +418,8 @@ void PicoAshaComm::handleEventPacket(asha::comm::HeaderPacket const header, asha
             return;
         }
         qDebug() << "Remote Connected";
+        m_bleConnectionState = BLEConnectionState::Connected;
+        m_ui->setBLEConnectionState(m_bleConnectionState);
         auto r = m_ui->addRemote(header.conn_id);
         if (r) {
             QByteArray addr((const char*)pkt.data.conn_info.addr, sizeof(pkt.data.conn_info.addr));
@@ -430,6 +440,20 @@ void PicoAshaComm::handleEventPacket(asha::comm::HeaderPacket const header, asha
             cached_remote_props.insert(props.addr, props);
         }
         m_ui->removeRemote(header.conn_id);
+        // Firmware-managed reconnect owns gap_disconnect -> reset -> scan. Do
+        // not send Command::Restart here or from a timer. Older firmware does
+        // not advertise the capability, so the GUI reports disconnected and
+        // leaves the historical manual Restart action available.
+        m_bleConnectionState = m_firmwareManagedReconnect
+                                   ? BLEConnectionState::Recovering
+                                   : BLEConnectionState::Disconnected;
+        m_ui->setBLEConnectionState(m_bleConnectionState);
+        break;
+    case EventType::BLEConnectionState:
+        if (!m_firmwareManagedReconnect) break;
+        m_bleConnectionState = static_cast<BLEConnectionState>(
+            pkt.data.ble_connection_state);
+        m_ui->setBLEConnectionState(m_bleConnectionState);
         break;
     case EventType::DiscServices:
         if (checkError(header, pkt, "DiscoverServices")) {

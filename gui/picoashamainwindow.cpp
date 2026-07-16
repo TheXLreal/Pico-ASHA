@@ -181,11 +181,15 @@ PicoAshaMainWindow::PicoAshaMainWindow(QWidget *parent)
     m_serialConnectedStatus = new QLabel();
     onSerialConnected(false);
 
+    m_bleConnectionStatus = new QLabel();
+    setBLEConnectionState(asha::comm::BLEConnectionState::Disconnected);
+
     m_encodeTimesLabel = new QLabel();
     m_encodeTimes.reserve(1000);
 
     QStatusBar* mainStatusBar = new QStatusBar;
     mainStatusBar->addPermanentWidget(m_encodeTimesLabel);
+    mainStatusBar->addPermanentWidget(m_bleConnectionStatus);
     mainStatusBar->addPermanentWidget(m_serialConnectedStatus);
     setStatusBar(mainStatusBar);
 }
@@ -425,5 +429,37 @@ void PicoAshaMainWindow::setUSBWidgetsEnabled(bool enabled)
 void PicoAshaMainWindow::setPicoAshaVerStr(const QString &version)
 {
     m_serialConnectedStatus->setText(QString("Connected :: %1").arg(version));
+}
+
+void PicoAshaMainWindow::setBLEConnectionState(asha::comm::BLEConnectionState state)
+{
+    using enum asha::comm::BLEConnectionState;
+    switch (state) {
+    case Disconnected:
+        m_bleConnectionStatus->setText("BLE: disconnected");
+        m_bleConnectionStatus->setStyleSheet("QLabel { color : red; }");
+        break;
+    case Recovering:
+        m_bleConnectionStatus->setText("BLE: recovering");
+        m_bleConnectionStatus->setStyleSheet("QLabel { color : darkorange; }");
+        break;
+    case Scanning:
+        m_bleConnectionStatus->setText("BLE: scanning");
+        m_bleConnectionStatus->setStyleSheet("QLabel { color : darkorange; }");
+        break;
+    case Connecting:
+        m_bleConnectionStatus->setText("BLE: connecting");
+        m_bleConnectionStatus->setStyleSheet("QLabel { color : darkorange; }");
+        break;
+    case Connected:
+        m_bleConnectionStatus->setText("BLE: connected");
+        m_bleConnectionStatus->setStyleSheet("QLabel { color : green; }");
+        break;
+    }
+}
+
+void PicoAshaMainWindow::setRestartButtonEnabled(bool enabled)
+{
+    m_cmdRestartBtn->setEnabled(enabled);
 }
 

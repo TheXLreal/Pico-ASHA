@@ -1,5 +1,6 @@
 #include <bitset>
 #include <pico/assert.h>
+#include <pico/time.h>
 
 #include "hearing_aid.hpp"
 #include "asha_uuid.hpp"
@@ -235,6 +236,7 @@ void HearingAid::on_serial_host_connected()
     if (audio_streaming_enabled) {
         intro_flags |= IntroFlags::streaming_enabled;
     }
+    intro_flags |= IntroFlags::firmware_managed_reconnect;
     send_intro_packet((int8_t)num_connected(), intro_flags);
     USBInfo usb_info = {
         .uac_vers = usb_settings.uac_version,
@@ -243,6 +245,7 @@ void HearingAid::on_serial_host_connected()
         .reserved = 0
     };
     send_usb_info_packet(usb_info);
+    set_ble_connection_state(ble_connection_state, true);
     for (auto ha : hearing_aids) {
         if (!ha->is_connected()) {
             continue;
@@ -292,6 +295,7 @@ void HearingAid::set_connections_allowed(bool allowed)
     if (connections_allowed && !allowed) {
         connections_allowed = false;
         gap_stop_scan();
+        set_ble_connection_state(comm::BLEConnectionState::Disconnected);
         for (auto ha : hearing_aids) {
             if (ha->is_connected()) {
                 ha->disconnect();
@@ -316,8 +320,11 @@ void HearingAid::set_auto_pair_enabled(bool enabled)
 void HearingAid::start_scan()
 {
     if (connections_allowed) {
+        set_ble_connection_state(comm::BLEConnectionState::Scanning);
         gap_set_scan_params(1, 0x0030, 0x0030, runtime_settings.get_full_set_paired() ? 1 : 0);
         gap_start_scan();
+    } else {
+        set_ble_connection_state(comm::BLEConnectionState::Disconnected);
     }
 }
 
@@ -347,6 +354,7 @@ void HearingAid::on_ad_report(const AdvertisingReport& report)
 
 void HearingAid::connect(const bd_addr_t addr, bd_addr_type_t addr_type)
 {
+    set_ble_connection_state(comm::BLEConnectionState::Connecting);
     gap_stop_scan();
     gap_connect(addr, addr_type);
 }
@@ -369,6 +377,7 @@ void HearingAid::on_connected(bd_addr_t addr, hci_con_handle_t handle,
 #endif
         set_other_side_ptrs();
         ha_cached->assign_next_conn_id();
+        set_ble_connection_state(BLEConnectionState::Connected);
 
         EventPacket ev_pkt(EventType::RemoteConnected);
         ev_pkt.data.conn_info.hci_handle = handle;
@@ -392,6 +401,7 @@ void HearingAid::on_connected(bd_addr_t addr, hci_con_handle_t handle,
 #endif
         set_other_side_ptrs();
         ha->assign_next_conn_id();
+        set_ble_connection_state(BLEConnectionState::Connected);
 
         EventPacket ev_pkt(EventType::RemoteConnected);
         ev_pkt.data.conn_info.hci_handle = handle;
@@ -429,11 +439,17 @@ void HearingAid::on_connection_parameters_updated(hci_con_handle_t handle,
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE_RSSI
 void HearingAid::sample_rssi()
 {
+    if (rssi_request_pending) {
+        audio_stall_trace_rssi_request_skipped();
+        return;
+    }
     static uint8_t next_slot = 0U;
     for (uint8_t count = 0U; count < hearing_aids.size(); ++count) {
         HearingAid* ha = hearing_aids[next_slot];
         next_slot = (next_slot + 1U) % hearing_aids.size();
         if (!ha->is_connected()) continue;
+        rssi_request_pending = true;
+        rssi_request_handle = ha->conn_handle;
         (void)gap_read_rssi(ha->conn_handle);
         break;
     }
@@ -441,6 +457,10 @@ void HearingAid::sample_rssi()
 
 void HearingAid::on_rssi(hci_con_handle_t handle, int8_t rssi)
 {
+    if (rssi_request_pending && handle == rssi_request_handle) {
+        rssi_request_pending = false;
+        rssi_request_handle = HCI_CON_HANDLE_INVALID;
+    }
     HearingAid* ha = get_by_con_handle(handle);
     if (ha == nullptr) return;
     audio_stall_trace_rssi(handle, ha->cid, ha->trace_last_sequence,
@@ -452,6 +472,12 @@ void HearingAid::on_rssi(hci_con_handle_t handle, int8_t rssi)
 void HearingAid::on_disconnected(hci_con_handle_t handle, uint8_t status, uint8_t reason)
 {
     using namespace comm;
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE_RSSI
+    if (rssi_request_pending && handle == rssi_request_handle) {
+        rssi_request_pending = false;
+        rssi_request_handle = HCI_CON_HANDLE_INVALID;
+    }
+#endif
     HearingAid* ha = get_by_con_handle(handle);
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
     uint64_t now_us = audio_stall_trace_now_us();
@@ -481,6 +507,7 @@ void HearingAid::on_disconnected(hci_con_handle_t handle, uint8_t status, uint8_
     // }
     EventPacket ev_pkt(EventType::RemoteDisconnected, StatusType::ATTStatus, status, reason);
     add_event_to_buffer(ha->conn_id, ev_pkt);
+    set_ble_connection_state(BLEConnectionState::Disconnected);
     if (ha->other && ha->other->is_streaming()) {
         ha->other->send_acp_status(ACPStatus::other_disconnected);
     }
@@ -493,6 +520,9 @@ void HearingAid::on_disconnected(hci_con_handle_t handle, uint8_t status, uint8_
         led_mgr.set_led_pattern(one_connected);
     } else {
         led_mgr.set_led_pattern(none_connected);
+    }
+    if (connections_allowed) {
+        set_ble_connection_state(BLEConnectionState::Recovering);
     }
     start_scan();
 }
@@ -978,51 +1008,67 @@ void HearingAid::handle_l2cap_cbm(PACKET_HANDLER_PARAMS)
         case L2CAP_EVENT_CAN_SEND_NOW:
             cid = l2cap_event_can_send_now_get_local_cid(packet);
             ha = get_by_cid(cid);
-#ifdef PICO_ASHA_AUDIO_STALL_TRACE
-            {
-                uint64_t now_us = audio_stall_trace_now_us();
-                uint32_t wait_us = now_us > ha->trace_can_send_request_us
-                                       ? static_cast<uint32_t>(std::min<uint64_t>(
-                                             now_us - ha->trace_can_send_request_us, UINT32_MAX))
-                                       : 0U;
-                uint32_t write_index = asha_audio_get_write_index();
-                audio_stall_trace_can_send_now(ha->conn_handle, cid,
-                                               ha->trace_pending_sequence,
-                                               write_index, ha->curr_read_index, true,
-                                               wait_us);
-                ha->trace_l2cap_send_us = now_us;
-                uint8_t result = l2cap_send(cid, ha->audio_data, ASHA_SDU_SIZE_BYTES);
-                audio_stall_trace_l2cap_send(ha->conn_handle, cid,
-                                             ha->trace_pending_sequence,
-                                             write_index, ha->curr_read_index, true,
-                                             ASHA_SDU_SIZE_BYTES, result);
-                if (result == ERROR_CODE_SUCCESS) {
-                    ha->trace_last_sequence = ha->trace_pending_sequence;
-                }
+            if (ha == nullptr || ha->audio_tx_state != AudioTxState::WaitingCanSendNow) {
+                // A direct watchdog recovery leaves BTstack's original request
+                // pending. BTstack clears it before delivering the eventual stale
+                // event, which must not trigger a second send.
+                break;
             }
-#else
-            l2cap_send(cid, ha->audio_data, ASHA_SDU_SIZE_BYTES);
+            {
+                uint32_t write_index = asha_audio_get_write_index();
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+                uint64_t now_us = time_us_64();
+                uint32_t wait_us = now_us > ha->audio_tx_state_since_us
+                                       ? static_cast<uint32_t>(std::min<uint64_t>(
+                                             now_us - ha->audio_tx_state_since_us, UINT32_MAX))
+                                       : 0U;
+                audio_stall_trace_can_send_now(ha->conn_handle, cid,
+                                               ha->audio_tx_sequence,
+                                               write_index, ha->curr_read_index,
+                                               (ha->audio_state & AudioState::AudioBusy) != 0U,
+                                               wait_us);
 #endif
+                ha->send_pending_audio(false, write_index);
+            }
             break;
         case L2CAP_EVENT_PACKET_SENT:
             cid = l2cap_event_packet_sent_get_local_cid(packet);
             ha = get_by_cid(cid);
-#ifdef PICO_ASHA_AUDIO_STALL_TRACE
-            {
-                uint64_t now_us = audio_stall_trace_now_us();
-                uint32_t wait_us = now_us > ha->trace_l2cap_send_us
-                                       ? static_cast<uint32_t>(std::min<uint64_t>(
-                                             now_us - ha->trace_l2cap_send_us, UINT32_MAX))
-                                       : 0U;
-                audio_stall_trace_packet_sent(ha->conn_handle, cid,
-                                              ha->trace_pending_sequence,
-                                              asha_audio_get_write_index(),
-                                              ha->curr_read_index, true, wait_us);
-                ha->trace_last_successful_send_us = now_us;
-                ha->trace_last_sequence = ha->trace_pending_sequence;
+            if (ha == nullptr || ha->audio_tx_state != AudioTxState::WaitingPacketSent) {
+                // Do not let an event from an older SDU clear AudioBusy or complete
+                // the currently pending request.
+                break;
             }
+            {
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+                uint64_t now_us = time_us_64();
+                uint32_t wait_us = now_us > ha->audio_tx_state_since_us
+                                       ? static_cast<uint32_t>(std::min<uint64_t>(
+                                             now_us - ha->audio_tx_state_since_us, UINT32_MAX))
+                                       : 0U;
+                uint8_t sequence = ha->audio_tx_sequence;
 #endif
-            ha->unset_audio_busy(AUDIO_STALL_TRACE_BUSY_CONTEXT_PACKET_SENT);
+
+                // Complete the local phase before any callback-visible work. A
+                // stale CAN_SEND_NOW emitted by BTstack after direct recovery is
+                // therefore ignored by the case above.
+                ha->audio_tx_state = AudioTxState::Idle;
+                ha->audio_tx_state_since_us = 0U;
+                ha->audio_tx_sequence = AUDIO_STALL_TRACE_INVALID_SEQUENCE;
+                ha->audio_tx_local_recovery = false;
+                ha->audio_data = nullptr;
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+                audio_stall_trace_packet_sent(ha->conn_handle, cid,
+                                              sequence,
+                                              asha_audio_get_write_index(),
+                                              ha->curr_read_index,
+                                              (ha->audio_state & AudioState::AudioBusy) != 0U,
+                                              wait_us);
+                ha->trace_last_successful_send_us = now_us;
+                ha->trace_last_sequence = sequence;
+#endif
+                ha->unset_audio_busy(AUDIO_STALL_TRACE_BUSY_CONTEXT_PACKET_SENT);
+            }
             break;
         default:
             break;
@@ -1181,6 +1227,15 @@ bool HearingAid::process_audio()
         }
 #endif
         if (ha->process_state != ProcessState::Audio) { continue; }
+        // The remote ASHA stream remains active until ACP Stop completes. A
+        // selected SDU must therefore be recovered even if host PCM stops while
+        // the L2CAP request is stuck.
+        bool audio_active = ha->is_streaming();
+        if (ha->process_audio_tx_watchdog(w_index, audio_active)) {
+            // One SDU already owns the TX path. In particular, never issue a
+            // second CAN_SEND_NOW request while the original one is pending.
+            continue;
+        }
         ha->credits = l2cap_cbm_available_credits(ha->cid);
         switch (ha->audio_state) {
             case AudioState::Ready:
@@ -1274,20 +1329,15 @@ bool HearingAid::process_audio()
 
                         enum AshaAudioSide audio_side = ha->rop.side() == Side::Left ? AshaAudioSide::AudioLeft
                                                                                      : AshaAudioSide::AudioRight;
-                        ha->audio_data = asha_audio_get_encoded_at_index(audio_side, ha->curr_read_index);
+                        uint8_t* encoded = asha_audio_get_encoded_at_index(
+                            audio_side, ha->curr_read_index);
+                        memcpy(ha->audio_tx_buffer.data(), encoded,
+                               ha->audio_tx_buffer.size());
+                        ha->audio_data = ha->audio_tx_buffer.data();
+                        ha->audio_tx_ring_index = ha->curr_read_index;
+                        ha->audio_tx_sdu_since_us = time_us_64();
                         ++(ha->curr_read_index);
-                        ha->set_audio_busy(ha->audio_data[0],
-                                           AUDIO_STALL_TRACE_BUSY_CONTEXT_AUDIO_SDU);
-#ifdef PICO_ASHA_AUDIO_STALL_TRACE
-                        ha->trace_pending_sequence = ha->audio_data[0];
-                        ha->trace_can_send_request_us = audio_stall_trace_now_us();
-#endif
-                        l2cap_request_can_send_now_event(ha->cid);
-#ifdef PICO_ASHA_AUDIO_STALL_TRACE
-                        audio_stall_trace_can_send_requested(
-                            ha->conn_handle, ha->cid, ha->trace_pending_sequence,
-                            w_index, ha->curr_read_index, true);
-#endif
+                        ha->request_audio_can_send(w_index);
                         enable_process_delay = true;
 #ifdef PICO_ASHA_ENC_STATS
                         send_enc_times = true;
@@ -1399,6 +1449,21 @@ void HearingAid::set_other_side_ptrs()
     }
 }
 
+comm::BLEConnectionState HearingAid::get_ble_connection_state()
+{
+    return ble_connection_state;
+}
+
+void HearingAid::set_ble_connection_state(comm::BLEConnectionState state,
+                                           bool force_event)
+{
+    if (!force_event && ble_connection_state == state) return;
+    ble_connection_state = state;
+    comm::EventPacket event(comm::EventType::BLEConnectionState);
+    event.data.ble_connection_state = static_cast<uint8_t>(state);
+    comm::add_event_to_buffer(comm::unset_conn_id, event);
+}
+
 void HearingAid::assign_next_conn_id()
 {
     ++next_conn_id;
@@ -1469,6 +1534,203 @@ void HearingAid::unset_audio_busy(int32_t context)
 #else
     (void)context;
 #endif
+}
+
+bool HearingAid::request_audio_can_send(uint32_t write_index)
+{
+    if (audio_tx_state != AudioTxState::Idle || audio_data == nullptr) {
+        return false;
+    }
+
+    uint64_t now_us = time_us_64();
+    audio_tx_sequence = audio_data[0];
+    audio_tx_state = AudioTxState::WaitingCanSendNow;
+    audio_tx_state_since_us = now_us;
+    audio_tx_local_recovery = false;
+    set_audio_busy(audio_tx_sequence, AUDIO_STALL_TRACE_BUSY_CONTEXT_AUDIO_SDU);
+
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    trace_pending_sequence = audio_tx_sequence;
+    trace_can_send_request_us = now_us;
+    // Record the request before the BTstack call because CAN_SEND_NOW may be
+    // delivered synchronously from l2cap_request_can_send_now_event().
+    audio_stall_trace_can_send_requested(conn_handle, cid, audio_tx_sequence,
+                                         write_index, curr_read_index, true);
+#endif
+
+    uint8_t result = l2cap_request_can_send_now_event(cid);
+    if (result != ERROR_CODE_SUCCESS) {
+        reconnect_after_audio_tx_stall(write_index, 0U, result);
+        return false;
+    }
+    return true;
+}
+
+bool HearingAid::send_pending_audio(bool local_recovery, uint32_t write_index)
+{
+    if (audio_data == nullptr) {
+        reconnect_after_audio_tx_stall(write_index, 0U, ERROR_CODE_COMMAND_DISALLOWED);
+        return false;
+    }
+
+    uint64_t now_us = time_us_64();
+    uint8_t sequence = audio_tx_sequence;
+
+    // The phase transition must precede l2cap_send(): BTstack is allowed to
+    // make progress synchronously and emit PACKET_SENT from inside the call.
+    audio_tx_state = AudioTxState::WaitingPacketSent;
+    audio_tx_state_since_us = now_us;
+    audio_tx_local_recovery = local_recovery;
+    if ((audio_state & AudioState::AudioBusy) == 0U) {
+        set_audio_busy(sequence, AUDIO_STALL_TRACE_BUSY_CONTEXT_AUDIO_SDU);
+    }
+
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    trace_l2cap_send_us = now_us;
+#endif
+    uint8_t result = l2cap_send(cid, audio_data, ASHA_SDU_SIZE_BYTES);
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    audio_stall_trace_l2cap_send(conn_handle, cid, sequence, write_index,
+                                 curr_read_index,
+                                 (audio_state & AudioState::AudioBusy) != 0U,
+                                 ASHA_SDU_SIZE_BYTES, result);
+    if (result == ERROR_CODE_SUCCESS) {
+        trace_last_sequence = sequence;
+    }
+#endif
+    if (result != ERROR_CODE_SUCCESS) {
+        reconnect_after_audio_tx_stall(write_index, 0U, result);
+        return false;
+    }
+    return true;
+}
+
+bool HearingAid::process_audio_tx_watchdog(uint32_t write_index, bool audio_active)
+{
+    if (audio_tx_state == AudioTxState::Idle) {
+        return false;
+    }
+
+    uint64_t now_us = time_us_64();
+    uint32_t stalled_us = now_us > audio_tx_state_since_us
+                              ? static_cast<uint32_t>(std::min<uint64_t>(
+                                    now_us - audio_tx_state_since_us, UINT32_MAX))
+                              : 0U;
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    bool busy = (audio_state & AudioState::AudioBusy) != 0U;
+#endif
+
+    if (audio_data == nullptr) {
+        reconnect_after_audio_tx_stall(write_index, stalled_us,
+                                       ERROR_CODE_COMMAND_DISALLOWED);
+        return true;
+    }
+
+    // A pending phase owns the TX path even when AudioBusy was incorrectly
+    // cleared. This is the invariant that prevents duplicate pending requests.
+    if (!audio_active) {
+        return true;
+    }
+
+    if (audio_tx_state == AudioTxState::WaitingCanSendNow) {
+        if (stalled_us < audio_can_send_watchdog_us) {
+            return true;
+        }
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+        audio_stall_trace_tx_watchdog(AUDIO_STALL_TRACE_TX_WATCHDOG,
+                                      conn_handle, cid, audio_tx_sequence,
+                                      write_index, curr_read_index, busy,
+                                      stalled_us, 0);
+#endif
+
+        // Do not call l2cap_request_can_send_now_event() again: BTstack still
+        // owns the original request. If the channel can accept an SDU, queue the
+        // selected frame directly and ignore the eventual stale callback.
+        if (l2cap_can_send_packet_now(cid)) {
+            uint32_t audio_age_us = now_us > audio_tx_sdu_since_us
+                                        ? static_cast<uint32_t>(std::min<uint64_t>(
+                                              now_us - audio_tx_sdu_since_us,
+                                              UINT32_MAX))
+                                        : 0U;
+            if (audio_age_us > audio_tx_max_audio_age_us) {
+                // No SDU has been handed to BTstack in this phase, so replacing
+                // the private TX copy is safe. Skip the old pending frame and
+                // backlog; never replay stale audio after recovery.
+                if (write_index <= audio_tx_ring_index + 1U) {
+                    reconnect_after_audio_tx_stall(write_index, stalled_us,
+                                                   ERROR_CODE_CONNECTION_TIMEOUT);
+                    return true;
+                }
+                uint32_t latest_index = write_index - 1U;
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+                uint32_t dropped_frames = latest_index - audio_tx_ring_index;
+                uint8_t old_sequence = audio_tx_sequence;
+#endif
+                enum AshaAudioSide audio_side = rop.side() == Side::Left
+                                                    ? AshaAudioSide::AudioLeft
+                                                    : AshaAudioSide::AudioRight;
+                uint8_t* latest = asha_audio_get_encoded_at_index(audio_side,
+                                                                  latest_index);
+                memcpy(audio_tx_buffer.data(), latest, audio_tx_buffer.size());
+                audio_data = audio_tx_buffer.data();
+                audio_tx_ring_index = latest_index;
+                audio_tx_sdu_since_us = now_us;
+                audio_tx_sequence = audio_data[0];
+                curr_read_index = write_index;
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+                trace_pending_sequence = audio_tx_sequence;
+                audio_stall_trace_tx_stale_drop(
+                    conn_handle, cid, old_sequence, audio_tx_sequence,
+                    write_index, curr_read_index, busy, audio_age_us,
+                    dropped_frames);
+#endif
+            }
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+            audio_stall_trace_tx_watchdog(AUDIO_STALL_TRACE_TX_RECOVERY,
+                                          conn_handle, cid, audio_tx_sequence,
+                                          write_index, curr_read_index, busy,
+                                          stalled_us, ERROR_CODE_SUCCESS);
+#endif
+            send_pending_audio(true, write_index);
+        } else {
+            reconnect_after_audio_tx_stall(write_index, stalled_us,
+                                           BTSTACK_ACL_BUFFERS_FULL);
+        }
+        return true;
+    }
+
+    if (stalled_us >= audio_packet_sent_watchdog_us) {
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+        audio_stall_trace_tx_watchdog(AUDIO_STALL_TRACE_TX_WATCHDOG,
+                                      conn_handle, cid, audio_tx_sequence,
+                                      write_index, curr_read_index, busy,
+                                      stalled_us, ERROR_CODE_CONNECTION_TIMEOUT);
+#endif
+        reconnect_after_audio_tx_stall(write_index, stalled_us,
+                                       ERROR_CODE_CONNECTION_TIMEOUT);
+    }
+    return true;
+}
+
+void HearingAid::reconnect_after_audio_tx_stall(uint32_t write_index,
+                                                uint32_t stalled_us,
+                                                int32_t result)
+{
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    audio_stall_trace_tx_watchdog(AUDIO_STALL_TRACE_TX_RECONNECT,
+                                  conn_handle, cid, audio_tx_sequence,
+                                  write_index, curr_read_index,
+                                  (audio_state & AudioState::AudioBusy) != 0U,
+                                  stalled_us, result);
+#else
+    (void)write_index;
+    (void)stalled_us;
+    (void)result;
+#endif
+
+    // The existing disconnection-complete path resets all ASHA/L2CAP state and
+    // calls start_scan(), preserving pairing while creating a fresh CID.
+    disconnect();
 }
 
 void HearingAid::set_data_langth()
@@ -1560,6 +1822,13 @@ void HearingAid::send_volume(int8_t volume)
 void HearingAid::disconnect()
 {
     //LOG_INFO("%s: Disconnect requested", get_side_str());
+    audio_tx_state = AudioTxState::Idle;
+    audio_tx_state_since_us = 0U;
+    audio_tx_sdu_since_us = 0U;
+    audio_tx_ring_index = 0U;
+    audio_tx_sequence = AUDIO_STALL_TRACE_INVALID_SEQUENCE;
+    audio_tx_local_recovery = false;
+    audio_data = nullptr;
     process_state = ProcessState::Disconnect;
     gap_disconnect(conn_handle);
 }
@@ -1580,6 +1849,13 @@ void HearingAid::reset()
     error_count = 0;
     service_index = 0;
     chars_index = cached_chars_index;
+    audio_data = nullptr;
+    audio_tx_state = AudioTxState::Idle;
+    audio_tx_state_since_us = 0U;
+    audio_tx_sdu_since_us = 0U;
+    audio_tx_ring_index = 0U;
+    audio_tx_sequence = AUDIO_STALL_TRACE_INVALID_SEQUENCE;
+    audio_tx_local_recovery = false;
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
     trace_can_send_request_us = 0U;
     trace_l2cap_send_us = 0U;

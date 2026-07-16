@@ -81,6 +81,7 @@ set(ASHA_SRC
   src/runtime_settings.cpp
   src/asha_audio.c
   src/audio_stall_trace.c
+  src/cyw43_trace_hooks.c
   src/asha_bt.cpp
   src/asha_comms.cpp
   src/asha_led.cpp
@@ -105,6 +106,11 @@ endif(ENABLE_AUDIO_ENC_STATS)
 
 if (ENABLE_AUDIO_STALL_TRACE)
   list(APPEND pico_asha_defines "PICO_ASHA_AUDIO_STALL_TRACE=1")
+  target_link_options(pico_asha PUBLIC
+    -Wl,--wrap=cyw43_bluetooth_hci_write
+    -Wl,--wrap=cyw43_thread_enter
+    -Wl,--wrap=cyw43_thread_exit
+  )
 endif()
 
 if (ENABLE_AUDIO_STALL_TRACE_RSSI)

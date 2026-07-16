@@ -87,6 +87,11 @@ namespace comm
                                               trace_records_per_packet * sizeof(AudioStallTraceRecord);
     static_assert(zero_prefix + COBS_ENCODE_MAX(max_trace_decoded_size) <=
                   COBS_TINYFRAME_SAFE_BUFFER_SIZE);
+    constexpr size_t max_runtime_snapshot_decoded_size =
+        sizeof(HeaderPacket) + sizeof(AudioStallTracePacketHeader) +
+        sizeof(AudioStallTraceRuntimeSnapshot);
+    static_assert(zero_prefix + COBS_ENCODE_MAX(max_runtime_snapshot_decoded_size) <=
+                  COBS_TINYFRAME_SAFE_BUFFER_SIZE);
     static uint8_t trace_cobs_enc_buff[COBS_TINYFRAME_SAFE_BUFFER_SIZE];
     static std::array<AudioStallTraceRecord, trace_records_per_packet> pending_trace_records;
     static uint8_t pending_trace_record_count = 0;
@@ -188,7 +193,7 @@ namespace comm
     void try_send_usb_packets()
     {
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
-        if (!stdio_usb_connected()) return;
+        if (!tud_cdc_connected()) return;
         for (uint32_t sent = 0; sent < usb_tx_send_limit; ++sent) {
             uint32_t read_index = usb_tx_read_index.load(std::memory_order_relaxed);
             uint32_t write_index = usb_tx_write_index.load(std::memory_order_acquire);
@@ -246,7 +251,7 @@ namespace comm
 
     void try_send_audio_trace()
     {
-        if (!stdio_usb_connected()) return;
+        if (!tud_cdc_connected()) return;
         uint64_t now_us = audio_stall_trace_now_us();
 
         if (last_trace_snapshot_us == 0U ||
@@ -255,6 +260,13 @@ namespace comm
             audio_stall_trace_snapshot(&snapshot, now_us);
             if (!send_audio_trace_payload(AUDIO_STALL_TRACE_PAYLOAD_SNAPSHOT, 1U,
                                           &snapshot, sizeof(snapshot), now_us)) {
+                return;
+            }
+            AudioStallTraceRuntimeSnapshot runtime_snapshot = {};
+            audio_stall_trace_runtime_snapshot(&runtime_snapshot, now_us);
+            if (!send_audio_trace_payload(AUDIO_STALL_TRACE_PAYLOAD_RUNTIME_SNAPSHOT,
+                                          1U, &runtime_snapshot,
+                                          sizeof(runtime_snapshot), now_us)) {
                 return;
             }
             last_trace_snapshot_us = now_us;

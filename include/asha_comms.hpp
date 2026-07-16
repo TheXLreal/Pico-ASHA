@@ -16,10 +16,21 @@ namespace comm
         constexpr uint16_t streaming_enabled = 1 << 1u;
         // UAC1: bit 0, UAC2: bit 1
         constexpr uint16_t uac_version = 1 << 2u;
+        // Firmware owns automatic BLE recovery/reconnect. A GUI must not send
+        // Command::Restart in response to RemoteDisconnected when this is set.
+        constexpr uint16_t firmware_managed_reconnect = 1 << 3u;
     }
 
     enum class CSide : uint8_t {Left = 0, Right = 1, Unset = 2};
     enum class CMode : uint8_t {Mono = 0, Binaural = 1, Unset = 2};
+
+    enum class BLEConnectionState : uint8_t {
+        Disconnected = 0,
+        Recovering,
+        Scanning,
+        Connecting,
+        Connected,
+    };
 
     enum class Type : uint8_t
     {
@@ -94,6 +105,7 @@ namespace comm
         MfiBatteryRead,
         MFIBatteryNotEnable,
         G722EncTimings,
+        BLEConnectionState,
     };
 
     enum class CmdType : uint8_t {
@@ -210,6 +222,7 @@ namespace comm
             uint8_t rop[17];
             char    str[32];
             uint8_t battery_level;
+            uint8_t ble_connection_state;
             int16_t encode_timings[10];
         } data = {};
 

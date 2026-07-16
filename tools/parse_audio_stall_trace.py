@@ -26,9 +26,11 @@ PICO_HEADER = struct.Struct("<BBHI")
 TRACE_HEADER = struct.Struct("<IBBBB")
 TRACE_RECORD = struct.Struct("<QIIIIIiHHBBBB")
 SNAPSHOT = struct.Struct("<Q" + "I" * 21)
+RUNTIME_SNAPSHOT = struct.Struct("<Q" + "I" * 14 + "i" * 2 + "I" * 4)
 
 PAYLOAD_RECORDS = 1
 PAYLOAD_SNAPSHOT = 2
+PAYLOAD_RUNTIME_SNAPSHOT = 3
 
 EVENT_NAMES = {
     1: "AUDIO_SDU_GENERATED",
@@ -46,6 +48,16 @@ EVENT_NAMES = {
     13: "AUDIO_TIMER_LATE",
     14: "USB_PCM_UNDERRUN",
     15: "RSSI_SAMPLE",
+    16: "AUDIO_TX_WATCHDOG",
+    17: "AUDIO_TX_RECOVERY",
+    18: "AUDIO_TX_RECONNECT",
+    19: "AUDIO_TX_STALE_DROP",
+    20: "HCI_WRITE_BEGIN",
+    21: "HCI_WRITE_END",
+    22: "CYW43_LOCK_WAIT_BEGIN",
+    23: "CYW43_LOCK_ACQUIRED",
+    24: "CYW43_LOCK_HELD",
+    25: "RSSI_CONTEXT",
 }
 
 SNAPSHOT_FIELDS = (
@@ -70,6 +82,29 @@ SNAPSHOT_FIELDS = (
     "audio_timer_late_count",
     "usb_pcm_underrun_count",
     "trace_dropped",
+)
+
+RUNTIME_SNAPSHOT_FIELDS = (
+    "hci_write_count",
+    "hci_write_error_count",
+    "hci_write_last_us",
+    "hci_write_max_us",
+    "cyw43_lock_wait_last_us",
+    "cyw43_lock_wait_max_us",
+    "cyw43_lock_hold_last_us",
+    "cyw43_lock_hold_max_us",
+    "btstack_run_loop_gap_last_us",
+    "btstack_run_loop_gap_max_us",
+    "hci_to_packet_sent_last_us",
+    "hci_to_packet_sent_max_us",
+    "rssi_sample_count",
+    "rssi_request_skipped_count",
+    "rssi_slot0_dbm",
+    "rssi_slot1_dbm",
+    "rssi_slot0_age_us",
+    "rssi_slot1_age_us",
+    "tx_stale_drop_count",
+    "tx_stale_drop_frames",
 )
 
 
@@ -184,7 +219,21 @@ def parse_trace_payload(payload: bytes) -> tuple[list[TraceRecord], list[TraceSn
             return [], []
         values = SNAPSHOT.unpack(body)
         snapshots.append(TraceSnapshot(values[0], dict(zip(SNAPSHOT_FIELDS, values[1:]))))
+    elif kind == PAYLOAD_RUNTIME_SNAPSHOT:
+        if count != 1 or len(body) != RUNTIME_SNAPSHOT.size:
+            return [], []
+        values = RUNTIME_SNAPSHOT.unpack(body)
+        snapshots.append(TraceSnapshot(
+            values[0], dict(zip(RUNTIME_SNAPSHOT_FIELDS, values[1:]))
+        ))
     return records, snapshots
+
+
+def merge_snapshots(snapshots: Iterable[TraceSnapshot]) -> list[TraceSnapshot]:
+    merged: dict[int, dict[str, int]] = {}
+    for snapshot in snapshots:
+        merged.setdefault(snapshot.timestamp_us, {}).update(snapshot.counters)
+    return [TraceSnapshot(timestamp, merged[timestamp]) for timestamp in sorted(merged)]
 
 
 def parse_decoded_packet(packet: bytes) -> tuple[list[TraceRecord], list[TraceSnapshot]]:
@@ -211,8 +260,7 @@ def parse_capture(data: bytes) -> tuple[list[TraceRecord], list[TraceSnapshot]]:
         records.extend(packet_records)
         snapshots.extend(packet_snapshots)
     records.sort(key=lambda record: record.timestamp_us)
-    snapshots.sort(key=lambda snapshot: snapshot.timestamp_us)
-    return records, snapshots
+    return records, merge_snapshots(snapshots)
 
 
 def anomaly_reasons(record: TraceRecord) -> list[str]:
@@ -234,9 +282,21 @@ def anomaly_reasons(record: TraceRecord) -> list[str]:
     if record.event_type == 10:
         reasons.append("ble_disconnect")
     if record.event_type == 13:
-        reasons.append("audio_timer_interval_gt_2ms")
+        reasons.append("audio_timer_late_gt_5ms")
     if record.event_type == 14:
         reasons.append("usb_pcm_underrun")
+    if record.event_type == 16:
+        reasons.append("audio_tx_watchdog")
+    if record.event_type == 18:
+        reasons.append("audio_tx_reconnect")
+    if record.event_type == 19:
+        reasons.append("audio_tx_stale_drop")
+    if record.event_type == 21:
+        reasons.append("hci_write_slow")
+    if record.event_type == 23:
+        reasons.append("cyw43_lock_wait_slow")
+    if record.event_type == 24:
+        reasons.append("cyw43_lock_held_slow")
     if record.ring_fill >= RING_CAPACITY:
         reasons.append("ring_full")
     return reasons
@@ -262,6 +322,22 @@ def event_details(record: TraceRecord) -> str:
                 f"supervision_timeout_ms={timeout * 10}")
     if record.event_type == 15:
         return f"rssi_dbm={record.result}"
+    if record.event_type in (16, 17, 18):
+        rssi_valid = bool(record.detail1 & 0x100)
+        rssi = (record.detail1 & 0xFF)
+        if rssi >= 128:
+            rssi -= 256
+        return (f"rssi_dbm={rssi if rssi_valid else 'unknown'};"
+                f"rssi_age_us={record.detail0}")
+    if record.event_type == 19:
+        return (f"old_sequence={record.sequence};new_sequence={record.detail1 & 0xff};"
+                f"dropped_frames={record.detail0};age_us={record.duration_us}")
+    if record.event_type in (20, 21):
+        return f"hci_packet_type={record.detail0};duration_us={record.duration_us}"
+    if record.event_type in (22, 23, 24):
+        return f"duration_us={record.duration_us}"
+    if record.event_type == 25:
+        return f"rssi_dbm={record.result};sample_age_us={record.duration_us}"
     return ""
 
 

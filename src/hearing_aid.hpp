@@ -22,6 +22,12 @@ constexpr int ha_process_delay_ticks = 500;
 // at 1 ms, so this is 3 seconds.
 constexpr uint32_t ready_stuck_timeout_ticks = 3000;
 
+// CAN_SEND waits above 25 ms are anomalous. Start recovery at 30 ms, but do
+// not transmit audio older than three 20-ms ASHA frames.
+constexpr uint32_t audio_can_send_watchdog_us = 30'000;
+constexpr uint32_t audio_tx_max_audio_age_us = 60'000;
+constexpr uint32_t audio_packet_sent_watchdog_us = 150'000;
+
 enum class Side  {Left = 0, Right = 1};
 enum class Mode  {Mono = 0, Binaural = 1};
 enum class Codec {G722_16, G722_24};
@@ -76,6 +82,12 @@ struct HearingAid
         Streaming           = 1U <<  3,
         Stop                = 1U <<  4,
         AudioBusy           = 1U << 31
+    };
+
+    enum class AudioTxState : uint8_t {
+        Idle,
+        WaitingCanSendNow,
+        WaitingPacketSent,
     };
 
     bool connected = false;
@@ -141,6 +153,7 @@ struct HearingAid
                                                  uint16_t connection_interval,
                                                  uint16_t peripheral_latency,
                                                  uint16_t supervision_timeout);
+    static comm::BLEConnectionState get_ble_connection_state();
     static void on_data_len_set(hci_con_handle_t handle, uint16_t rx_octets, uint16_t rx_time, uint16_t tx_octets, uint16_t tx_time);
     static void delete_pair();
     static void delete_pair(uint16_t conn_id);
@@ -234,7 +247,17 @@ private:
 
     uint32_t curr_read_index = 0U;
     bool first_audio_send = false;
+    // BTstack retains the SDU pointer until L2CAP_EVENT_PACKET_SENT. Keep the
+    // selected frame out of the eight-slot encoder ring so watchdog recovery
+    // cannot race a producer overwrite.
+    std::array<uint8_t, ASHA_SDU_SIZE_BYTES> audio_tx_buffer = {};
     uint8_t* audio_data = nullptr;
+    AudioTxState audio_tx_state = AudioTxState::Idle;
+    uint64_t audio_tx_state_since_us = 0U;
+    uint64_t audio_tx_sdu_since_us = 0U;
+    uint32_t audio_tx_ring_index = 0U;
+    uint8_t audio_tx_sequence = AUDIO_STALL_TRACE_INVALID_SEQUENCE;
+    bool audio_tx_local_recovery = false;
 
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
     uint64_t trace_can_send_request_us = 0U;
@@ -261,6 +284,12 @@ private:
     inline static bool connections_allowed;
     inline static bool audio_streaming_enabled;
     inline static bool auto_pair_enabled;
+    inline static comm::BLEConnectionState ble_connection_state =
+        comm::BLEConnectionState::Disconnected;
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE_RSSI
+    inline static bool rssi_request_pending = false;
+    inline static hci_con_handle_t rssi_request_handle = HCI_CON_HANDLE_INVALID;
+#endif
 
     /* Member functions */
 
@@ -269,6 +298,8 @@ private:
     static HearingAid* get_by_conn_id(uint16_t conn_id);
     static HearingAid* get_by_cached_addr(bd_addr_t addr);
     static void set_other_side_ptrs();
+    static void set_ble_connection_state(comm::BLEConnectionState state,
+                                         bool force_event = false);
     void assign_next_conn_id();
     bool is_connected();
     bool is_streaming();
@@ -277,6 +308,11 @@ private:
     void set_audio_busy(uint8_t sequence = AUDIO_STALL_TRACE_INVALID_SEQUENCE,
                         int32_t context = 0);
     void unset_audio_busy(int32_t context = 0);
+    bool request_audio_can_send(uint32_t write_index);
+    bool send_pending_audio(bool local_recovery, uint32_t write_index);
+    bool process_audio_tx_watchdog(uint32_t write_index, bool audio_active);
+    void reconnect_after_audio_tx_stall(uint32_t write_index, uint32_t stalled_us,
+                                        int32_t result);
     void set_data_langth();
     void send_acp_start();
     void send_acp_stop();

@@ -56,7 +56,11 @@ private:
 
     QFile m_hciLogFile;
 
-    bool m_serialConnected;
+    bool m_serialConnected = false;
+    bool m_firmwareManagedReconnect = false;
+    bool m_manualRestartPending = false;
+    asha::comm::BLEConnectionState m_bleConnectionState =
+        asha::comm::BLEConnectionState::Disconnected;
 
     QString m_paFirmwareVers;
 

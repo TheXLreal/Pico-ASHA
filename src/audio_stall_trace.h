@@ -14,6 +14,12 @@ extern "C" {
 #define AUDIO_STALL_TRACE_INVALID_HANDLE 0xffffu
 #define AUDIO_STALL_TRACE_SNAPSHOT_INTERVAL_US 250000u
 #define AUDIO_STALL_TRACE_ANOMALY_US 25000u
+/* The Pico BTstack adapter adds one millisecond to the requested 1-ms timer;
+ * observed healthy cadence is about 2.16 ms. Only gaps above 5 ms are late. */
+#define AUDIO_STALL_TRACE_AUDIO_TIMER_LATE_US 5000u
+#define AUDIO_STALL_TRACE_HCI_WRITE_SLOW_US 5000u
+#define AUDIO_STALL_TRACE_CYW43_LOCK_WAIT_SLOW_US 1000u
+#define AUDIO_STALL_TRACE_CYW43_LOCK_HELD_SLOW_US 5000u
 
 enum AudioStallTraceEvent {
     AUDIO_STALL_TRACE_SDU_GENERATED = 1,
@@ -31,11 +37,22 @@ enum AudioStallTraceEvent {
     AUDIO_STALL_TRACE_AUDIO_TIMER_LATE,
     AUDIO_STALL_TRACE_USB_PCM_UNDERRUN,
     AUDIO_STALL_TRACE_RSSI_SAMPLE,
+    AUDIO_STALL_TRACE_TX_WATCHDOG,
+    AUDIO_STALL_TRACE_TX_RECOVERY,
+    AUDIO_STALL_TRACE_TX_RECONNECT,
+    AUDIO_STALL_TRACE_TX_STALE_DROP,
+    AUDIO_STALL_TRACE_HCI_WRITE_BEGIN,
+    AUDIO_STALL_TRACE_HCI_WRITE_END,
+    AUDIO_STALL_TRACE_CYW43_LOCK_WAIT_BEGIN,
+    AUDIO_STALL_TRACE_CYW43_LOCK_ACQUIRED,
+    AUDIO_STALL_TRACE_CYW43_LOCK_HELD,
+    AUDIO_STALL_TRACE_RSSI_CONTEXT,
 };
 
 enum AudioStallTracePayloadKind {
     AUDIO_STALL_TRACE_PAYLOAD_RECORDS = 1,
     AUDIO_STALL_TRACE_PAYLOAD_SNAPSHOT,
+    AUDIO_STALL_TRACE_PAYLOAD_RUNTIME_SNAPSHOT,
 };
 
 enum AudioStallTraceBusyContext {
@@ -103,14 +120,43 @@ typedef struct __attribute__((packed, aligned(4))) AudioStallTraceSnapshot {
     uint32_t trace_dropped;
 } AudioStallTraceSnapshot;
 
+/* Optional version-1 extension. Existing record and snapshot layouts stay
+ * unchanged; older parsers safely ignore this payload kind. */
+typedef struct __attribute__((packed, aligned(4))) AudioStallTraceRuntimeSnapshot {
+    uint64_t timestamp_us;
+    uint32_t hci_write_count;
+    uint32_t hci_write_error_count;
+    uint32_t hci_write_last_us;
+    uint32_t hci_write_max_us;
+    uint32_t cyw43_lock_wait_last_us;
+    uint32_t cyw43_lock_wait_max_us;
+    uint32_t cyw43_lock_hold_last_us;
+    uint32_t cyw43_lock_hold_max_us;
+    uint32_t btstack_run_loop_gap_last_us;
+    uint32_t btstack_run_loop_gap_max_us;
+    uint32_t hci_to_packet_sent_last_us;
+    uint32_t hci_to_packet_sent_max_us;
+    uint32_t rssi_sample_count;
+    uint32_t rssi_request_skipped_count;
+    int32_t rssi_slot0_dbm;
+    int32_t rssi_slot1_dbm;
+    uint32_t rssi_slot0_age_us;
+    uint32_t rssi_slot1_age_us;
+    uint32_t tx_stale_drop_count;
+    uint32_t tx_stale_drop_frames;
+} AudioStallTraceRuntimeSnapshot;
+
 #if defined(__cplusplus)
 static_assert(sizeof(AudioStallTraceRecord) == 40);
 static_assert(sizeof(AudioStallTracePacketHeader) == 8);
 static_assert(sizeof(AudioStallTraceSnapshot) == 92);
+static_assert(sizeof(AudioStallTraceRuntimeSnapshot) == 88);
 #else
 _Static_assert(sizeof(AudioStallTraceRecord) == 40, "Unexpected trace record size");
 _Static_assert(sizeof(AudioStallTracePacketHeader) == 8, "Unexpected trace header size");
 _Static_assert(sizeof(AudioStallTraceSnapshot) == 92, "Unexpected trace snapshot size");
+_Static_assert(sizeof(AudioStallTraceRuntimeSnapshot) == 88,
+               "Unexpected runtime snapshot size");
 #endif
 
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
@@ -150,9 +196,25 @@ void audio_stall_trace_audio_timer_tick(uint64_t now_us);
 void audio_stall_trace_usb_pcm_underrun(uint32_t gap_us, uint32_t write_index);
 void audio_stall_trace_rssi(uint16_t handle, uint16_t cid, uint8_t sequence,
                             uint32_t write_index, uint32_t read_index, bool busy, int8_t rssi);
+void audio_stall_trace_rssi_request_skipped(void);
+void audio_stall_trace_tx_watchdog(uint8_t event_type, uint16_t handle, uint16_t cid,
+                                   uint8_t sequence, uint32_t write_index,
+                                   uint32_t read_index, bool busy, uint32_t stalled_us,
+                                   int32_t result);
+void audio_stall_trace_tx_stale_drop(uint16_t handle, uint16_t cid,
+                                     uint8_t old_sequence, uint8_t new_sequence,
+                                     uint32_t write_index, uint32_t read_index,
+                                     bool busy, uint32_t age_us,
+                                     uint32_t dropped_frames);
+void audio_stall_trace_hci_write(uint64_t begin_us, uint64_t end_us,
+                                 uint8_t packet_type, int32_t result);
+void audio_stall_trace_cyw43_lock_acquired(uint64_t begin_us, uint64_t acquired_us);
+void audio_stall_trace_cyw43_lock_released(uint64_t acquired_us, uint64_t released_us);
 
 bool audio_stall_trace_pop(AudioStallTraceRecord *record);
 void audio_stall_trace_snapshot(AudioStallTraceSnapshot *snapshot, uint64_t now_us);
+void audio_stall_trace_runtime_snapshot(AudioStallTraceRuntimeSnapshot *snapshot,
+                                        uint64_t now_us);
 
 #else
 

@@ -88,6 +88,61 @@ class ParseAudioStallTraceTest(unittest.TestCase):
         self.assertEqual(1, len(snapshots))
         self.assertEqual(21, snapshots[0].counters["trace_dropped"])
 
+    def test_tx_watchdog_events_keep_record_format_and_mark_reconnect(self):
+        capture = packet([
+            record(300_000, 16, duration=100_000),
+            record(300_100, 17, duration=100_100),
+            record(450_100, 18, duration=150_000, result=0x08),
+        ])
+
+        records, snapshots = trace.parse_capture(capture)
+        self.assertEqual([], snapshots)
+        self.assertEqual(
+            ["AUDIO_TX_WATCHDOG", "AUDIO_TX_RECOVERY", "AUDIO_TX_RECONNECT"],
+            [item.event for item in records],
+        )
+        self.assertIn("audio_tx_watchdog", trace.anomaly_reasons(records[0]))
+        self.assertEqual([], trace.anomaly_reasons(records[1]))
+        self.assertIn("audio_tx_reconnect", trace.anomaly_reasons(records[2]))
+
+    def test_runtime_snapshot_merges_with_legacy_snapshot(self):
+        legacy_values = [500_000] + list(range(1, 22))
+        legacy_body = trace.SNAPSHOT.pack(*legacy_values)
+        runtime_values = [500_000] + list(range(101, 115)) + [-55, -61] + list(range(115, 119))
+        runtime_body = trace.RUNTIME_SNAPSHOT.pack(*runtime_values)
+
+        def snapshot_packet(kind, body):
+            envelope = trace.TRACE_HEADER.pack(
+                trace.TRACE_MAGIC, trace.TRACE_VERSION, kind, 1, len(body)
+            ) + body
+            header = trace.PICO_HEADER.pack(
+                trace.ASHA_TYPE_AUDIO_TRACE,
+                trace.PICO_HEADER.size + len(envelope), 0, 0,
+            )
+            return b"\0" + cobs_encode(header + envelope)
+
+        capture = snapshot_packet(trace.PAYLOAD_SNAPSHOT, legacy_body)
+        capture += snapshot_packet(trace.PAYLOAD_RUNTIME_SNAPSHOT, runtime_body)
+        records, snapshots = trace.parse_capture(capture)
+
+        self.assertEqual([], records)
+        self.assertEqual(1, len(snapshots))
+        self.assertEqual(1, snapshots[0].counters["sdu_generated_count"])
+        self.assertEqual(101, snapshots[0].counters["hci_write_count"])
+        self.assertEqual(-55, snapshots[0].counters["rssi_slot0_dbm"])
+
+    def test_serious_timer_and_platform_events_are_anomalies(self):
+        records = [
+            trace.TraceRecord(*trace.TRACE_RECORD.unpack(record(1, 13, duration=5_001))),
+            trace.TraceRecord(*trace.TRACE_RECORD.unpack(record(2, 19, duration=70_000))),
+            trace.TraceRecord(*trace.TRACE_RECORD.unpack(record(3, 21, duration=6_000))),
+            trace.TraceRecord(*trace.TRACE_RECORD.unpack(record(4, 23, duration=2_000))),
+        ]
+        self.assertIn("audio_timer_late_gt_5ms", trace.anomaly_reasons(records[0]))
+        self.assertIn("audio_tx_stale_drop", trace.anomaly_reasons(records[1]))
+        self.assertIn("hci_write_slow", trace.anomaly_reasons(records[2]))
+        self.assertIn("cyw43_lock_wait_slow", trace.anomaly_reasons(records[3]))
+
     def test_interrupted_capture_saves_bytes_and_discards_partial_frame(self):
         complete_packet = packet([record(100_000, 1, handle=trace.INVALID_HANDLE, cid=0)])
         partial_frame = b"\x05incomplete"
