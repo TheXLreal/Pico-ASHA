@@ -115,6 +115,13 @@ class TimelineRow:
     sequence_unwrapped: int | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class CaptureResult:
+    data: bytes
+    interrupted: bool = False
+    error: str | None = None
+
+
 def cobs_decode(frame: bytes) -> bytes:
     """Decode one COBS frame, including its trailing zero delimiter."""
     if len(frame) < 2 or frame[-1] != 0 or frame[0] == 0:
@@ -413,19 +420,64 @@ def write_csv(path: Path, rows: Iterable[dict[str, object]]) -> int:
     return len(materialized)
 
 
-def capture_serial(port: str, seconds: float, baudrate: int) -> bytes:
-    try:
-        import serial  # type: ignore[import-not-found]
-    except ImportError as error:
-        raise RuntimeError("live capture requires pyserial: python -m pip install pyserial") from error
+def capture_serial(
+    port: str,
+    seconds: float,
+    baudrate: int,
+    raw_output: Path,
+    *,
+    serial_factory=None,
+    serial_errors: tuple[type[BaseException], ...] | None = None,
+    flush_interval: float = 1.0,
+) -> CaptureResult:
+    """Capture CDC bytes while continuously preserving them in *raw_output*.
+
+    KeyboardInterrupt and serial-port failures are converted into a partial
+    CaptureResult. The serial context manager and output-file context manager
+    are both exited before the captured bytes are returned.
+    """
+    if serial_factory is None:
+        try:
+            import serial  # type: ignore[import-not-found]
+        except ImportError as error:
+            raise RuntimeError("live capture requires pyserial: python -m pip install pyserial") from error
+        serial_factory = serial.Serial
+        serial_errors = (serial.SerialException, OSError)
+    elif serial_errors is None:
+        serial_errors = (OSError,)
+
+    raw_output.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + seconds
-    chunks: list[bytes] = []
-    with serial.Serial(port, baudrate=baudrate, timeout=0.1) as connection:
-        while time.monotonic() < deadline:
-            chunk = connection.read(max(1, connection.in_waiting))
-            if chunk:
-                chunks.append(chunk)
-    return b"".join(chunks)
+    next_flush = time.monotonic() + max(0.0, flush_interval)
+    interrupted = False
+    capture_error: str | None = None
+
+    # Open the raw file first, so even failure while opening the COM port leaves
+    # a well-defined capture artifact. Each received chunk is persisted before
+    # the next potentially interruptible serial read.
+    with raw_output.open("wb") as output:
+        try:
+            with serial_factory(port, baudrate=baudrate, timeout=0.1) as connection:
+                while time.monotonic() < deadline:
+                    chunk = connection.read(max(1, connection.in_waiting))
+                    if chunk:
+                        output.write(chunk)
+                    now = time.monotonic()
+                    if now >= next_flush:
+                        output.flush()
+                        next_flush = now + max(0.0, flush_interval)
+        except KeyboardInterrupt:
+            interrupted = True
+        except serial_errors as error:
+            capture_error = f"{type(error).__name__}: {error}"
+        finally:
+            output.flush()
+
+    return CaptureResult(
+        data=raw_output.read_bytes(),
+        interrupted=interrupted,
+        error=capture_error,
+    )
 
 
 def output_paths(base: Path, args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
@@ -456,12 +508,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     if args.capture_port:
         try:
-            data = capture_serial(args.capture_port, args.capture_seconds, args.baudrate)
+            capture = capture_serial(
+                args.capture_port,
+                args.capture_seconds,
+                args.baudrate,
+                args.raw_output,
+            )
         except RuntimeError as error:
             print(f"error: {error}", file=sys.stderr)
             return 2
-        args.raw_output.write_bytes(data)
+        data = capture.data
         source = args.raw_output
+        print(f"captured {len(data)} bytes; raw capture saved to {source}")
+        if capture.interrupted:
+            print("capture interrupted by Ctrl+C; parsing saved partial data", file=sys.stderr)
+        if capture.error:
+            print(f"serial capture stopped: {capture.error}; parsing saved partial data",
+                  file=sys.stderr)
     elif args.input:
         source = args.input
         data = source.read_bytes()

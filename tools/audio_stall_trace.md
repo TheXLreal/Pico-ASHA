@@ -35,6 +35,11 @@ be parsed without dependencies:
 python tools/parse_audio_stall_trace.py audio_stall_trace.bin
 ```
 
+Live capture writes every received chunk directly to `--raw-output` and
+flushes periodically. Ctrl+C, a COM-port error, or device removal closes the
+port, preserves the partial raw file, and then parses every complete COBS frame
+captured before the interruption. An incomplete trailing frame is ignored.
+
 The parser writes event, aggregate-snapshot, per-sequence timeline, and
 five-seconds-before-disconnect CSV files. Durations above 25 ms, timer gaps
 above 2 ms, L2CAP errors, ring underruns/overruns, and disconnects are marked

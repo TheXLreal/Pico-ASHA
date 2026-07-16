@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -86,6 +87,102 @@ class ParseAudioStallTraceTest(unittest.TestCase):
         self.assertEqual([], records)
         self.assertEqual(1, len(snapshots))
         self.assertEqual(21, snapshots[0].counters["trace_dropped"])
+
+    def test_interrupted_capture_saves_bytes_and_discards_partial_frame(self):
+        complete_packet = packet([record(100_000, 1, handle=trace.INVALID_HANDLE, cid=0)])
+        partial_frame = b"\x05incomplete"
+
+        class InterruptedSerial:
+            closed = False
+
+            def __init__(self, _port, *, baudrate, timeout):
+                self.chunks = iter((complete_packet, partial_frame))
+                self.next_size = len(complete_packet)
+                self.baudrate = baudrate
+                self.timeout = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                type(self).closed = True
+
+            @property
+            def in_waiting(self):
+                return self.next_size
+
+            def read(self, _size):
+                try:
+                    chunk = next(self.chunks)
+                except StopIteration:
+                    raise KeyboardInterrupt
+                self.next_size = len(partial_frame)
+                return chunk
+
+        with tempfile.TemporaryDirectory(dir=MODULE_PATH.parent) as directory:
+            raw_output = Path(directory) / "interrupted.bin"
+            result = trace.capture_serial(
+                "COM-test",
+                60.0,
+                115200,
+                raw_output,
+                serial_factory=InterruptedSerial,
+                serial_errors=(OSError,),
+                flush_interval=0.0,
+            )
+
+            expected = complete_packet + partial_frame
+            self.assertTrue(result.interrupted)
+            self.assertIsNone(result.error)
+            self.assertTrue(InterruptedSerial.closed)
+            self.assertEqual(expected, result.data)
+            self.assertEqual(expected, raw_output.read_bytes())
+
+            records, snapshots = trace.parse_capture(result.data)
+            self.assertEqual(1, len(records))
+            self.assertEqual([], snapshots)
+
+    def test_serial_error_preserves_partial_capture_and_closes_port(self):
+        complete_packet = packet([record(200_000, 10, result=0x0800)])
+
+        class FailingSerial:
+            closed = False
+
+            def __init__(self, _port, *, baudrate, timeout):
+                self.read_count = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                type(self).closed = True
+
+            @property
+            def in_waiting(self):
+                return len(complete_packet)
+
+            def read(self, _size):
+                if self.read_count == 0:
+                    self.read_count += 1
+                    return complete_packet
+                raise OSError("device disconnected")
+
+        with tempfile.TemporaryDirectory(dir=MODULE_PATH.parent) as directory:
+            raw_output = Path(directory) / "disconnected.bin"
+            result = trace.capture_serial(
+                "COM-test",
+                60.0,
+                115200,
+                raw_output,
+                serial_factory=FailingSerial,
+                serial_errors=(OSError,),
+            )
+
+            self.assertFalse(result.interrupted)
+            self.assertEqual("OSError: device disconnected", result.error)
+            self.assertTrue(FailingSerial.closed)
+            self.assertEqual(complete_packet, result.data)
+            self.assertEqual(complete_packet, raw_output.read_bytes())
 
 
 if __name__ == "__main__":
