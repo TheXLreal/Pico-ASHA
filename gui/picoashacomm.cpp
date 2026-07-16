@@ -365,7 +365,7 @@ void PicoAshaComm::handleDecodedData(QByteArray const& decoded)
         memcpy(&info, decoded.constData() + sizeof header, sizeof info);
         m_ui->addRemote(info);
         break;
-    case Type::Advert:
+    case Type::Advert: {
         AdvertisingPacket ad;
         if (!assert_packet_size(decoded.size(), "AdvertisingPacket", ad)) {
             return;
@@ -374,6 +374,7 @@ void PicoAshaComm::handleDecodedData(QByteArray const& decoded)
         memcpy(&ad, decoded.constData() + sizeof header, sizeof ad);
         m_ui->onAdPacketReceived(ad);
         break;
+    }
     case Type::AudioTrace:
         // Binary diagnostics are intentionally not rendered as per-packet text.
         break;
