@@ -117,11 +117,22 @@ void PicoAshaComm::onSerialReadyRead()
     for (const auto& b : data) {
         if (b == '\0') {
             if (m_currPacket.size() >= 4) {
+                // nanocobs expects the frame delimiter to be part of the
+                // encoded input. Without it, a decoded packet whose final byte
+                // is zero is returned one byte short (COBS_RET_ERR_EXHAUSTED),
+                // so HeaderPacket::len rejects otherwise valid trace records.
+                m_currPacket.append(COBS_FRAME_DELIMITER);
                 QByteArray decoded(COBS_TINYFRAME_SAFE_BUFFER_SIZE, '\0');
-                size_t dec_len;
-                cobs_decode(m_currPacket.data(), m_currPacket.size(), decoded.data(), decoded.capacity(), &dec_len);
-                decoded.resize(dec_len);
-                handleDecodedData(decoded);
+                size_t dec_len = 0;
+                const cobs_ret_t result = cobs_decode(
+                    m_currPacket.constData(), m_currPacket.size(),
+                    decoded.data(), decoded.capacity(), &dec_len);
+                if (result == COBS_RET_SUCCESS) {
+                    decoded.resize(static_cast<qsizetype>(dec_len));
+                    handleDecodedData(decoded);
+                } else {
+                    qDebug() << "Discarding invalid COBS frame:" << result;
+                }
             }
             m_currPacket.clear();
         } else {

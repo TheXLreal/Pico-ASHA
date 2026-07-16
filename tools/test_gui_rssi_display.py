@@ -20,6 +20,18 @@ def function_body(source: str, signature: str) -> str:
 
 
 class GuiRssiDisplayTest(unittest.TestCase):
+    def test_serial_decoder_keeps_required_cobs_delimiter(self):
+        comm = (ROOT / "gui" / "picoashacomm.cpp").read_text(encoding="utf-8")
+        reader = function_body(comm, "void PicoAshaComm::onSerialReadyRead")
+
+        append_delimiter = reader.index("m_currPacket.append(COBS_FRAME_DELIMITER)")
+        decode = reader.index("cobs_decode(")
+        dispatch = reader.index("handleDecodedData(decoded)")
+        self.assertLess(append_delimiter, decode)
+        self.assertLess(decode, dispatch)
+        self.assertIn("result == COBS_RET_SUCCESS", reader)
+        self.assertIn("size_t dec_len = 0", reader)
+
     def test_trace_wire_structs_are_portable_to_msvc(self):
         header = (ROOT / "src" / "audio_stall_trace.h").read_text(
             encoding="utf-8"
