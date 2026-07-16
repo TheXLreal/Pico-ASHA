@@ -8,7 +8,9 @@
 #include <QLabel>
 #include <QFormLayout>
 #include <QProgressBar>
+#include <QVector>
 #include "asha_comms.hpp"
+#include "rssihistorygraph.h"
 
 class RemoteDevice : public QGroupBox
 {
@@ -67,6 +69,10 @@ public:
     void setG24KHz(bool enabled);
     void setCurrBattery(uint8_t currBattery);
 
+    uint16_t hciHandle() const;
+    void addRssiSample(uint64_t timestampUs, int dbm);
+    void resetRssiHistory();
+
     void setDefaultValues();
     bool isDefaultValues();
     void setGreyedOut(bool enabled);
@@ -75,6 +81,8 @@ signals:
 
 private:
     void setupUI();
+    void updateRssiLabels();
+    static QString rssiQuality(int dbm);
 
     CachedProps m_cachedProps;
     QFormLayout m_formLayout;
@@ -95,6 +103,16 @@ private:
     QLabel m_audioStreamingLabel;
     QLabel m_currVolumeLabel;
     QProgressBar m_currBatteryBar;
+
+    QGroupBox m_rssiGroup;
+    QLabel m_rssiCurrentLabel;
+    QLabel m_rssiAverageLabel;
+    QLabel m_rssiMinimumLabel;
+    QLabel m_rssiQualityLabel;
+    RssiHistoryGraph m_rssiGraph;
+    QVector<RssiHistorySample> m_rssiHistory;
+
+    uint16_t m_hciHandle = 0xffff;
 
     bool greyedOut;
 };

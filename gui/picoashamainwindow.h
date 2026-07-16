@@ -33,6 +33,8 @@ public:
     void setRemoteOrder();
 
     RemoteDevice* getRemote(uint16_t connID);
+    RemoteDevice* getRemoteByHCIHandle(uint16_t hciHandle);
+    void resetRssiHistories();
 
     void onSerialConnected(bool connected);
 

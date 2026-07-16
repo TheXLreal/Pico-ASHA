@@ -1,6 +1,18 @@
 #include <QBitArray>
 #include <QByteArray>
+#include <QGridLayout>
+
+#include <algorithm>
+#include <limits>
+
 #include "remotedevice.h"
+
+namespace
+{
+constexpr qint64 rssi_average_window_ms = 10'000;
+constexpr qint64 rssi_history_window_ms = 60'000;
+constexpr uint16_t invalid_hci_handle = 0xffff;
+}
 
 RemoteDevice::RemoteDevice(QWidget *parent)
     : QGroupBox(parent)
@@ -64,7 +76,12 @@ void RemoteDevice::setConnID(uint16_t connID)
 
 void RemoteDevice::setHCIHandle(uint16_t hciHandle)
 {
-    m_hciConnHandleLabel.setText(QString("0x%1").arg((int)hciHandle, 2, 16));
+    if (m_hciHandle != hciHandle) {
+        resetRssiHistory();
+        m_hciHandle = hciHandle;
+    }
+    m_hciConnHandleLabel.setText(
+        QString("0x%1").arg(static_cast<int>(hciHandle), 4, 16, QLatin1Char('0')));
 }
 
 void RemoteDevice::setAddr(const uint8_t *addr)
@@ -173,6 +190,85 @@ void RemoteDevice::setCurrBattery(uint8_t currBattery)
     m_currBatteryBar.setValue(currBattery);
 }
 
+uint16_t RemoteDevice::hciHandle() const
+{
+    return m_hciHandle;
+}
+
+void RemoteDevice::addRssiSample(uint64_t timestampUs, int dbm)
+{
+    if (m_hciHandle == invalid_hci_handle || dbm < -127 || dbm > 20) return;
+
+    const qint64 timestampMs = static_cast<qint64>(timestampUs / 1000U);
+    if (!m_rssiHistory.isEmpty() &&
+        timestampMs < m_rssiHistory.constLast().timestampMs) {
+        // Firmware reboot/timestamp reset without a matching GUI lifecycle
+        // event must not mix two histories.
+        resetRssiHistory();
+    }
+
+    m_rssiHistory.append({timestampMs, dbm});
+    const qint64 cutoffMs = timestampMs - rssi_history_window_ms;
+    while (!m_rssiHistory.isEmpty() &&
+           m_rssiHistory.constFirst().timestampMs < cutoffMs) {
+        m_rssiHistory.removeFirst();
+    }
+
+    updateRssiLabels();
+    m_rssiGraph.setSamples(m_rssiHistory);
+}
+
+void RemoteDevice::resetRssiHistory()
+{
+    m_rssiHistory.clear();
+    m_rssiGraph.clearSamples();
+    m_rssiCurrentLabel.setText("unavailable");
+    m_rssiAverageLabel.setText("unavailable");
+    m_rssiMinimumLabel.setText("unavailable");
+    m_rssiQualityLabel.setText("unavailable");
+    m_rssiQualityLabel.setStyleSheet("font-weight: normal");
+}
+
+void RemoteDevice::updateRssiLabels()
+{
+    if (m_rssiHistory.isEmpty()) {
+        resetRssiHistory();
+        return;
+    }
+
+    const auto& current = m_rssiHistory.constLast();
+    const qint64 cutoffMs = current.timestampMs - rssi_average_window_ms;
+    qint64 sum = 0;
+    int count = 0;
+    int minimum = std::numeric_limits<int>::max();
+    for (auto it = m_rssiHistory.crbegin(); it != m_rssiHistory.crend(); ++it) {
+        if (it->timestampMs < cutoffMs) break;
+        sum += it->dbm;
+        minimum = std::min(minimum, it->dbm);
+        ++count;
+    }
+
+    m_rssiCurrentLabel.setText(QString("%1 dBm").arg(current.dbm));
+    m_rssiAverageLabel.setText(
+        QString("%1 dBm").arg(static_cast<double>(sum) / count, 0, 'f', 1));
+    m_rssiMinimumLabel.setText(QString("%1 dBm").arg(minimum));
+    m_rssiQualityLabel.setText(rssiQuality(current.dbm));
+
+    const char* color = current.dbm >= -60 ? "green"
+                        : current.dbm >= -70 ? "#9a7400"
+                        : current.dbm >= -80 ? "darkorange" : "red";
+    m_rssiQualityLabel.setStyleSheet(
+        QString("font-weight: bold; color: %1").arg(color));
+}
+
+QString RemoteDevice::rssiQuality(int dbm)
+{
+    if (dbm >= -60) return "good";
+    if (dbm >= -70) return "fair";
+    if (dbm >= -80) return "weak";
+    return "very weak";
+}
+
 void RemoteDevice::setDefaultValues()
 {
     setTitle("Side Unknown");
@@ -193,6 +289,8 @@ void RemoteDevice::setDefaultValues()
     m_audioStreamingLabel.setText("No");
     m_currVolumeLabel.setText("-128");
     m_currBatteryBar.setValue(0);
+    m_hciHandle = invalid_hci_handle;
+    resetRssiHistory();
 }
 
 bool RemoteDevice::isDefaultValues()
@@ -239,6 +337,22 @@ void RemoteDevice::setupUI()
     m_currBatteryBar.setRange(0, 10);
     m_currBatteryBar.setFormat("%v/%m");
     this->m_formLayout.addRow("Current Battery", &m_currBatteryBar);
+
+    m_rssiGroup.setTitle("BLE RSSI (radio signal only)");
+    m_rssiGroup.setToolTip("RSSI describes BLE radio signal strength only. "
+                           "It does not prove ASHA audio quality.");
+    auto rssiLayout = new QGridLayout;
+    rssiLayout->addWidget(new QLabel("Current"), 0, 0);
+    rssiLayout->addWidget(&m_rssiCurrentLabel, 0, 1);
+    rssiLayout->addWidget(new QLabel("10 s average"), 1, 0);
+    rssiLayout->addWidget(&m_rssiAverageLabel, 1, 1);
+    rssiLayout->addWidget(new QLabel("10 s minimum"), 2, 0);
+    rssiLayout->addWidget(&m_rssiMinimumLabel, 2, 1);
+    rssiLayout->addWidget(new QLabel("Signal"), 3, 0);
+    rssiLayout->addWidget(&m_rssiQualityLabel, 3, 1);
+    rssiLayout->addWidget(&m_rssiGraph, 4, 0, 1, 2);
+    m_rssiGroup.setLayout(rssiLayout);
+    m_formLayout.addRow(&m_rssiGroup);
 
     setLayout(&m_formLayout);
 }

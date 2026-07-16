@@ -61,17 +61,20 @@ namespace comm
     static uint8_t cobs_enc_buff[COBS_TINYFRAME_SAFE_BUFFER_SIZE];
 
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
-    // Protocol and HCI producers run on BTstack core 1. TinyUSB is owned by
-    // usb_main() on core 0, so complete COBS frames cross cores through this
-    // bounded, non-blocking SPSC queue.
+    // Protocol and HCI producers run on BTstack core 1, while audio-stall
+    // trace packets are produced by usb_main() on core 0. TinyUSB is owned by
+    // core 0, so all complete COBS frames pass through this bounded,
+    // non-blocking MPSC queue before they are written.
     constexpr uint32_t usb_tx_queue_size = 32;
     constexpr uint32_t usb_tx_queue_mask = usb_tx_queue_size - 1;
     constexpr uint32_t usb_tx_hci_limit = usb_tx_queue_size - 8;
     constexpr uint32_t usb_tx_send_limit = 4;
+    constexpr uint32_t usb_tx_enqueue_attempts = 4;
     static_assert((usb_tx_queue_size & usb_tx_queue_mask) == 0);
 
     struct USBTxFrame
     {
+        std::atomic_bool ready = false;
         uint16_t len = 0;
         std::array<uint8_t, COBS_TINYFRAME_SAFE_BUFFER_SIZE> data = {};
     };
@@ -80,6 +83,7 @@ namespace comm
     static std::atomic_uint32_t usb_tx_write_index = 0;
     static std::atomic_uint32_t usb_tx_read_index = 0;
     static_assert(std::atomic_uint32_t::is_always_lock_free);
+    static_assert(std::atomic_bool::is_always_lock_free);
 
     constexpr size_t trace_records_per_packet = 5;
     constexpr size_t max_trace_decoded_size = sizeof(HeaderPacket) +
@@ -129,15 +133,27 @@ namespace comm
     {
         if (data == nullptr || len == 0 || len > COBS_TINYFRAME_SAFE_BUFFER_SIZE) return false;
         uint32_t write_index = usb_tx_write_index.load(std::memory_order_relaxed);
-        uint32_t read_index = usb_tx_read_index.load(std::memory_order_acquire);
-        uint32_t fill = write_index - read_index;
-        if (fill >= usb_tx_queue_size || (hci_packet && fill >= usb_tx_hci_limit)) return false;
+        for (uint32_t attempt = 0; attempt < usb_tx_enqueue_attempts; ++attempt) {
+            uint32_t read_index = usb_tx_read_index.load(std::memory_order_acquire);
+            uint32_t fill = write_index - read_index;
+            if (fill >= usb_tx_queue_size ||
+                (hci_packet && fill >= usb_tx_hci_limit)) {
+                return false;
+            }
 
-        auto& frame = usb_tx_queue[write_index & usb_tx_queue_mask];
-        frame.len = len;
-        memcpy(frame.data.data(), data, len);
-        usb_tx_write_index.store(write_index + 1, std::memory_order_release);
-        return true;
+            if (!usb_tx_write_index.compare_exchange_weak(
+                    write_index, write_index + 1U,
+                    std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                continue;
+            }
+
+            auto& frame = usb_tx_queue[write_index & usb_tx_queue_mask];
+            frame.len = len;
+            memcpy(frame.data.data(), data, len);
+            frame.ready.store(true, std::memory_order_release);
+            return true;
+        }
+        return false;
     }
 #endif
 
@@ -199,10 +215,14 @@ namespace comm
             uint32_t write_index = usb_tx_write_index.load(std::memory_order_acquire);
             if (read_index == write_index) return;
 
-            const auto& frame = usb_tx_queue[read_index & usb_tx_queue_mask];
+            auto& frame = usb_tx_queue[read_index & usb_tx_queue_mask];
+            // A producer reserves its index before copying the frame. Never
+            // spin or expose a partially written packet if it was preempted.
+            if (!frame.ready.load(std::memory_order_acquire)) return;
             if (tud_cdc_write_available() < frame.len) return;
             if (tud_cdc_write(frame.data.data(), frame.len) != frame.len) return;
             tud_cdc_write_flush();
+            frame.ready.store(false, std::memory_order_release);
             usb_tx_read_index.store(read_index + 1, std::memory_order_release);
         }
 #endif

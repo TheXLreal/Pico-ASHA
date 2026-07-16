@@ -104,6 +104,11 @@ void usb_main(void)
   while (1)
   {
     tud_task(); // TinyUSB device task
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    // Poll independently of BTstack/Nucleus state. This only enqueues COBS
+    // frames; try_send_usb_packets() remains the sole TinyUSB writer.
+    comm::try_send_audio_trace();
+#endif
     comm::try_send_usb_packets();
     audio_task();
   }

@@ -9,6 +9,7 @@
 #include <nanocobs/cobs.h>
 
 #include "bt_status_err.hpp"
+#include "audio_stall_trace.h"
 
 #include "picoashacomm.h"
 
@@ -300,6 +301,49 @@ bool assert_packet_size(size_t dec_size, const char* pkt_type, T const& pkt)
     return true;
 }
 
+void PicoAshaComm::handleAudioTracePacket(const QByteArray &decoded)
+{
+    using namespace asha::comm;
+
+    const qsizetype traceHeaderOffset = sizeof(HeaderPacket);
+    const qsizetype payloadOffset = traceHeaderOffset +
+                                    sizeof(AudioStallTracePacketHeader);
+    if (decoded.size() < payloadOffset) return;
+
+    AudioStallTracePacketHeader traceHeader = {};
+    memcpy(&traceHeader, decoded.constData() + traceHeaderOffset,
+           sizeof(traceHeader));
+    if (traceHeader.magic != AUDIO_STALL_TRACE_MAGIC ||
+        traceHeader.version != AUDIO_STALL_TRACE_VERSION ||
+        payloadOffset + traceHeader.payload_size != decoded.size()) {
+        return;
+    }
+
+    // Runtime snapshots deliberately have no stable handle-to-slot mapping.
+    // The GUI consumes only the existing per-handle RSSI_SAMPLE records.
+    if (traceHeader.kind != AUDIO_STALL_TRACE_PAYLOAD_RECORDS ||
+        static_cast<qsizetype>(traceHeader.count) *
+                sizeof(AudioStallTraceRecord) != traceHeader.payload_size) {
+        return;
+    }
+
+    for (uint8_t index = 0; index < traceHeader.count; ++index) {
+        AudioStallTraceRecord record = {};
+        const qsizetype offset = payloadOffset +
+                                 index * sizeof(AudioStallTraceRecord);
+        memcpy(&record, decoded.constData() + offset, sizeof(record));
+        if (record.event_type != AUDIO_STALL_TRACE_RSSI_SAMPLE ||
+            record.connection_handle == AUDIO_STALL_TRACE_INVALID_HANDLE ||
+            record.result < -127 || record.result > 20) {
+            continue;
+        }
+
+        if (auto remote = m_ui->getRemoteByHCIHandle(record.connection_handle)) {
+            remote->addRssiSample(record.timestamp_us, record.result);
+        }
+    }
+}
+
 void PicoAshaComm::handleDecodedData(QByteArray const& decoded)
 {
     using namespace asha::comm;
@@ -383,9 +427,11 @@ void PicoAshaComm::handleDecodedData(QByteArray const& decoded)
         m_ui->onAdPacketReceived(ad);
         break;
     }
-    case Type::AudioTrace:
+    case Type::AudioTrace: {
         // Binary diagnostics are intentionally not rendered as per-packet text.
+        handleAudioTracePacket(decoded);
         break;
+    }
     }
 }
 
@@ -453,6 +499,10 @@ void PicoAshaComm::handleEventPacket(asha::comm::HeaderPacket const header, asha
         if (!m_firmwareManagedReconnect) break;
         m_bleConnectionState = static_cast<BLEConnectionState>(
             pkt.data.ble_connection_state);
+        if (m_bleConnectionState == BLEConnectionState::Disconnected ||
+            m_bleConnectionState == BLEConnectionState::Recovering) {
+            m_ui->resetRssiHistories();
+        }
         m_ui->setBLEConnectionState(m_bleConnectionState);
         break;
     case EventType::DiscServices:

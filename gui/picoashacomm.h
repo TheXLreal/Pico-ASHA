@@ -34,6 +34,7 @@ public:
 
 private:
     void handleDecodedData(QByteArray const& decoded);
+    void handleAudioTracePacket(QByteArray const& decoded);
     void handleEventPacket(asha::comm::HeaderPacket const header, asha::comm::EventPacket const& pkt);
     bool checkError(asha::comm::HeaderPacket const header, asha::comm::EventPacket const& pkt, QString const& state);
 

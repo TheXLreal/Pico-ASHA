@@ -21,38 +21,51 @@ def function_body(source: str, signature: str) -> str:
 
 
 class AudioTraceIntegrationTest(unittest.TestCase):
-    def test_btstack_run_loop_regularly_queues_trace(self):
-        bt_source = (ROOT / "src" / "asha_bt.cpp").read_text(encoding="utf-8")
-        timer = function_body(
-            bt_source, "static void audio_timer_handler(btstack_timer_source_t* timer)"
-        )
-
+    def test_usb_main_regularly_queues_trace_before_draining(self):
+        usb_source = (ROOT / "src" / "usb_audio.cpp").read_text(encoding="utf-8")
+        usb_body = function_body(usb_source, "void usb_main(void)")
+        loop = function_body(usb_body, "while (1)")
         self.assertRegex(
-            timer,
+            loop,
             re.compile(
                 r"#ifdef\s+PICO_ASHA_AUDIO_STALL_TRACE[\s\S]*?"
                 r"comm::try_send_audio_trace\(\);\s+#endif",
                 re.MULTILINE,
             ),
         )
-        # The poll happens on every run-loop tick, before audio/Nucleus state
-        # can take one of the early-return paths.
-        self.assertLess(
-            timer.index("comm::try_send_audio_trace();"),
-            timer.index("HearingAid::process_audio()"),
-        )
-
-        usb_source = (ROOT / "src" / "usb_audio.cpp").read_text(encoding="utf-8")
-        usb_body = function_body(usb_source, "void usb_main(void)")
-        loop = function_body(usb_body, "while (1)")
         self.assertIn("tud_task();", loop)
         self.assertIn("comm::try_send_usb_packets();", loop)
-        self.assertNotIn("try_send_audio_trace", loop)
+        self.assertLess(
+            loop.index("tud_task();"), loop.index("comm::try_send_audio_trace();")
+        )
+        self.assertLess(
+            loop.index("comm::try_send_audio_trace();"),
+            loop.index("comm::try_send_usb_packets();"),
+        )
+
+        bt_source = (ROOT / "src" / "asha_bt.cpp").read_text(encoding="utf-8")
+        timer = function_body(
+            bt_source, "static void audio_timer_handler(btstack_timer_source_t* timer)"
+        )
+        self.assertNotIn("try_send_audio_trace", timer)
 
         cpp_sources = "\n".join(
             path.read_text(encoding="utf-8") for path in (ROOT / "src").glob("*.cpp")
         )
         self.assertEqual(1, cpp_sources.count("comm::try_send_audio_trace();"))
+
+    def test_usb_tx_queue_is_bounded_nonblocking_mpsc(self):
+        source = (ROOT / "src" / "asha_comms.cpp").read_text(encoding="utf-8")
+        enqueue = function_body(source, "static bool enqueue_usb_packet")
+        usb_send = function_body(source, "void try_send_usb_packets")
+
+        self.assertIn("usb_tx_enqueue_attempts", enqueue)
+        self.assertIn("compare_exchange_weak", enqueue)
+        self.assertIn("frame.ready.store(true", enqueue)
+        self.assertIn("frame.ready.load", usb_send)
+        self.assertIn("frame.ready.store(false", usb_send)
+        self.assertNotIn("mutex", enqueue.lower())
+        self.assertNotIn("spin_lock", enqueue)
 
     def test_trace_payload_uses_single_usb_tx_path(self):
         source = (ROOT / "src" / "asha_comms.cpp").read_text(encoding="utf-8")
@@ -83,7 +96,7 @@ class AudioTraceIntegrationTest(unittest.TestCase):
         timer = function_body(
             bt_source, "static void audio_timer_handler(btstack_timer_source_t* timer)"
         )
-        self.assertIn("try_send_audio_trace", timer)
+        self.assertNotIn("try_send_audio_trace", timer)
         self.assertNotIn("tud_cdc_write", timer)
 
         comms_source = (ROOT / "src" / "asha_comms.cpp").read_text(encoding="utf-8")

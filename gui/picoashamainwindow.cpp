@@ -302,6 +302,23 @@ RemoteDevice *PicoAshaMainWindow::getRemote(uint16_t connID)
     return nullptr;
 }
 
+RemoteDevice *PicoAshaMainWindow::getRemoteByHCIHandle(uint16_t hciHandle)
+{
+    for (auto remote : std::as_const(m_remotes)) {
+        if (!remote->isDefaultValues() && remote->hciHandle() == hciHandle) {
+            return remote;
+        }
+    }
+    return nullptr;
+}
+
+void PicoAshaMainWindow::resetRssiHistories()
+{
+    for (auto remote : std::as_const(m_remotes)) {
+        remote->resetRssiHistory();
+    }
+}
+
 void PicoAshaMainWindow::setConnectionsAllowed(bool allowed)
 {
     m_connectionsAllowed = allowed;

@@ -21,7 +21,10 @@ qt_add_executable(PicoASHAGui
     picoashacomm.cpp
     remotedevice.h
     remotedevice.cpp
+    rssihistorygraph.h
+    rssihistorygraph.cpp
     ../include/asha_comms.hpp
+    ../src/audio_stall_trace.h
     ../include/bt_status_err.hpp
     ../lib/nanocobs/cobs.c
     picoashamainwindow.h 
@@ -30,7 +33,11 @@ qt_add_executable(PicoASHAGui
     pairdialog.cpp
 )
 
-target_include_directories(PicoASHAGui PUBLIC "${ASHA_COMM_INCLUDE_PATH}" "${ASHA_COMM_LIB_PATH}")
+target_include_directories(PicoASHAGui PUBLIC
+    "${ASHA_COMM_INCLUDE_PATH}"
+    "${ASHA_COMM_LIB_PATH}"
+    "${PROJECT_SOURCE_DIR}/../src"
+)
 
 # Qt for iOS sets MACOSX_BUNDLE_GUI_IDENTIFIER automatically since Qt 6.1.
 # If you are developing for iOS or macOS you should consider setting an
