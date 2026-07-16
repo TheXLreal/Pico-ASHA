@@ -62,6 +62,13 @@ enum AudioStallTraceBusyContext {
     AUDIO_STALL_TRACE_BUSY_CONTEXT_RESET,
 };
 
+#if defined(_MSC_VER)
+#define AUDIO_STALL_TRACE_WIRE_STRUCT __declspec(align(4))
+#pragma pack(push, 1)
+#else
+#define AUDIO_STALL_TRACE_WIRE_STRUCT __attribute__((packed, aligned(4)))
+#endif
+
 /*
  * Fixed wire record. All fields are little endian. Event-specific meanings:
  * - duration_us: generation interval, CAN_SEND wait, send-to-packet wait, or
@@ -71,7 +78,7 @@ enum AudioStallTraceBusyContext {
  * - result: BTstack result/status, packed disconnect status/reason, busy
  *   context, or signed RSSI.
  */
-typedef struct __attribute__((packed, aligned(4))) AudioStallTraceRecord {
+typedef struct AUDIO_STALL_TRACE_WIRE_STRUCT AudioStallTraceRecord {
     uint64_t timestamp_us;
     uint32_t write_index;
     uint32_t read_index;
@@ -87,7 +94,7 @@ typedef struct __attribute__((packed, aligned(4))) AudioStallTraceRecord {
     uint8_t audio_busy;
 } AudioStallTraceRecord;
 
-typedef struct __attribute__((packed, aligned(4))) AudioStallTracePacketHeader {
+typedef struct AUDIO_STALL_TRACE_WIRE_STRUCT AudioStallTracePacketHeader {
     uint32_t magic;
     uint8_t version;
     uint8_t kind;
@@ -95,7 +102,7 @@ typedef struct __attribute__((packed, aligned(4))) AudioStallTracePacketHeader {
     uint8_t payload_size;
 } AudioStallTracePacketHeader;
 
-typedef struct __attribute__((packed, aligned(4))) AudioStallTraceSnapshot {
+typedef struct AUDIO_STALL_TRACE_WIRE_STRUCT AudioStallTraceSnapshot {
     uint64_t timestamp_us;
     uint32_t sdu_generated_count;
     uint32_t l2cap_send_attempt_count;
@@ -122,7 +129,7 @@ typedef struct __attribute__((packed, aligned(4))) AudioStallTraceSnapshot {
 
 /* Optional version-1 extension. Existing record and snapshot layouts stay
  * unchanged; older parsers safely ignore this payload kind. */
-typedef struct __attribute__((packed, aligned(4))) AudioStallTraceRuntimeSnapshot {
+typedef struct AUDIO_STALL_TRACE_WIRE_STRUCT AudioStallTraceRuntimeSnapshot {
     uint64_t timestamp_us;
     uint32_t hci_write_count;
     uint32_t hci_write_error_count;
@@ -145,6 +152,11 @@ typedef struct __attribute__((packed, aligned(4))) AudioStallTraceRuntimeSnapsho
     uint32_t tx_stale_drop_count;
     uint32_t tx_stale_drop_frames;
 } AudioStallTraceRuntimeSnapshot;
+
+#if defined(_MSC_VER)
+#pragma pack(pop)
+#endif
+#undef AUDIO_STALL_TRACE_WIRE_STRUCT
 
 #if defined(__cplusplus)
 static_assert(sizeof(AudioStallTraceRecord) == 40);

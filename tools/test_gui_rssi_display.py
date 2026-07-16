@@ -20,6 +20,18 @@ def function_body(source: str, signature: str) -> str:
 
 
 class GuiRssiDisplayTest(unittest.TestCase):
+    def test_trace_wire_structs_are_portable_to_msvc(self):
+        header = (ROOT / "src" / "audio_stall_trace.h").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("defined(_MSC_VER)", header)
+        self.assertIn("__declspec(align(4))", header)
+        self.assertIn("#pragma pack(push, 1)", header)
+        self.assertIn("#pragma pack(pop)", header)
+        self.assertIn("__attribute__((packed, aligned(4)))", header)
+        self.assertEqual(4, header.count("typedef struct AUDIO_STALL_TRACE_WIRE_STRUCT"))
+
     def test_gui_consumes_existing_trace_samples_without_requesting_rssi(self):
         comm = (ROOT / "gui" / "picoashacomm.cpp").read_text(encoding="utf-8")
         parser = function_body(comm, "void PicoAshaComm::handleAudioTracePacket")
