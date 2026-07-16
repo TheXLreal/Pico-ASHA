@@ -281,6 +281,7 @@ namespace comm
     }
 
     void try_send_events();
+    void try_send_usb_packets();
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
     void try_send_audio_trace();
 #endif

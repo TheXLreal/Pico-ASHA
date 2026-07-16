@@ -236,11 +236,6 @@ static void audio_timer_handler(btstack_timer_source_t* timer)
     if (usb_serial_is_connected) {
         comm::try_send_events();
     }
-#ifdef PICO_ASHA_AUDIO_STALL_TRACE
-    if (stdio_usb_connected()) {
-        comm::try_send_audio_trace();
-    }
-#endif
     HearingAid::process();
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE_RSSI
     static uint64_t last_rssi_sample_us = 0U;

@@ -4,6 +4,7 @@
 
 #include <tusb.h>
 
+#include <atomic>
 #include <etl/circular_buffer.h>
 #include <nanocobs/cobs.h>
 
@@ -60,6 +61,26 @@ namespace comm
     static uint8_t cobs_enc_buff[COBS_TINYFRAME_SAFE_BUFFER_SIZE];
 
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    // Protocol and HCI producers run on BTstack core 1. TinyUSB is owned by
+    // usb_main() on core 0, so complete COBS frames cross cores through this
+    // bounded, non-blocking SPSC queue.
+    constexpr uint32_t usb_tx_queue_size = 32;
+    constexpr uint32_t usb_tx_queue_mask = usb_tx_queue_size - 1;
+    constexpr uint32_t usb_tx_hci_limit = usb_tx_queue_size - 8;
+    constexpr uint32_t usb_tx_send_limit = 4;
+    static_assert((usb_tx_queue_size & usb_tx_queue_mask) == 0);
+
+    struct USBTxFrame
+    {
+        uint16_t len = 0;
+        std::array<uint8_t, COBS_TINYFRAME_SAFE_BUFFER_SIZE> data = {};
+    };
+
+    static std::array<USBTxFrame, usb_tx_queue_size> usb_tx_queue;
+    static std::atomic_uint32_t usb_tx_write_index = 0;
+    static std::atomic_uint32_t usb_tx_read_index = 0;
+    static_assert(std::atomic_uint32_t::is_always_lock_free);
+
     constexpr size_t trace_records_per_packet = 5;
     constexpr size_t max_trace_decoded_size = sizeof(HeaderPacket) +
                                               sizeof(AudioStallTracePacketHeader) +
@@ -98,15 +119,37 @@ namespace comm
         return p;
     }
 
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    static bool enqueue_usb_packet(const uint8_t *data, uint16_t len, bool hci_packet = false)
+    {
+        if (data == nullptr || len == 0 || len > COBS_TINYFRAME_SAFE_BUFFER_SIZE) return false;
+        uint32_t write_index = usb_tx_write_index.load(std::memory_order_relaxed);
+        uint32_t read_index = usb_tx_read_index.load(std::memory_order_acquire);
+        uint32_t fill = write_index - read_index;
+        if (fill >= usb_tx_queue_size || (hci_packet && fill >= usb_tx_hci_limit)) return false;
+
+        auto& frame = usb_tx_queue[write_index & usb_tx_queue_mask];
+        frame.len = len;
+        memcpy(frame.data.data(), data, len);
+        usb_tx_write_index.store(write_index + 1, std::memory_order_release);
+        return true;
+    }
+#endif
+
     template<typename T>
-    static void construct_and_send_packet(Type header_type, uint16_t conn_id, T const& packet)
+    static bool construct_and_send_packet(Type header_type, uint16_t conn_id, T const& packet)
     {
         auto pkt = construct_packet(header_type, conn_id, packet);
 
         size_t enc_len = 0;
         cobs_encode(&pkt, sizeof(pkt), cobs_enc_buff + zero_prefix, sizeof(cobs_enc_buff) - zero_prefix, &enc_len);
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+        return enqueue_usb_packet(cobs_enc_buff, static_cast<uint16_t>(enc_len + zero_prefix));
+#else
         stdio_put_string((const char*)cobs_enc_buff, enc_len + zero_prefix, false, false);
         stdio_flush();
+        return true;
+#endif
     }
 
     void add_event_to_buffer(uint16_t const conn_id, EventPacket const& event)
@@ -120,6 +163,15 @@ namespace comm
 
     void try_send_events()
     {
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+        int send_count = 0;
+        while (!event_buff.empty() && send_count < send_limit && stdio_usb_connected()) {
+            const auto& buff = event_buff.front();
+            if (!enqueue_usb_packet(buff.data(), static_cast<uint16_t>(buff.size()))) break;
+            ++send_count;
+            event_buff.pop();
+        }
+#else
         bool flush_req = false;
         int send_count = 0;
         while (!event_buff.empty() && send_count < send_limit && stdio_usb_connected()) {
@@ -129,10 +181,26 @@ namespace comm
             ++send_count;
             event_buff.pop();
         }
-        if (flush_req) {
-            send_count = 0;
-            stdio_flush();
+        if (flush_req) stdio_flush();
+#endif
+    }
+
+    void try_send_usb_packets()
+    {
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+        if (!stdio_usb_connected()) return;
+        for (uint32_t sent = 0; sent < usb_tx_send_limit; ++sent) {
+            uint32_t read_index = usb_tx_read_index.load(std::memory_order_relaxed);
+            uint32_t write_index = usb_tx_write_index.load(std::memory_order_acquire);
+            if (read_index == write_index) return;
+
+            const auto& frame = usb_tx_queue[read_index & usb_tx_queue_mask];
+            if (tud_cdc_write_available() < frame.len) return;
+            if (tud_cdc_write(frame.data.data(), frame.len) != frame.len) return;
+            tud_cdc_write_flush();
+            usb_tx_read_index.store(read_index + 1, std::memory_order_release);
         }
+#endif
     }
 
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
@@ -309,17 +377,17 @@ namespace comm
         cobs_encode_inc(&enc_ctx, packet, incl_len);
         cobs_encode_inc_end(&enc_ctx, &enc_len);
 
-        // Write directly to CDC rather than via stdio_put_string(): the stdio
-        // path also writes to UART, where uart_putc() blocks on TX FIFO space
-        // at 115200 baud — at ~17 ms per 200-byte packet, this stalls core 1
-        // and causes the audio timer to miss ticks.
-        // This bypasses stdio_usb_mutex, creating a theoretical race if core 0
-        // calls tud_cdc_write() via stdio simultaneously. In practice core 0
-        // makes no stdio calls during audio streaming, so the risk is negligible.
         uint32_t total = enc_len + zero_prefix;
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+        // Do not call TinyUSB from this BTstack callback. Queue the complete
+        // frame without blocking; usb_main() sends it from core 0. HCI is
+        // capped below the queue capacity to reserve room for control events.
+        (void)enqueue_usb_packet(cobs_enc_buff, static_cast<uint16_t>(total), true);
+#else
         if (tud_cdc_write_available() < total) return;
         tud_cdc_write(cobs_enc_buff, total);
         tud_cdc_write_flush();
+#endif
     }
 
     void send_hci_message([[maybe_unused]] int log_level, 
