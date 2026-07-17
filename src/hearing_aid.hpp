@@ -261,6 +261,7 @@ private:
 
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
     uint64_t trace_can_send_request_us = 0U;
+    uint64_t trace_can_send_now_us = 0U;
     uint64_t trace_l2cap_send_us = 0U;
     uint64_t trace_audio_busy_since_us = 0U;
     uint64_t trace_last_successful_send_us = 0U;

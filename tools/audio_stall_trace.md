@@ -46,6 +46,21 @@ five-seconds-before-disconnect CSV files. Durations above 25 ms, timer gaps
 above 5 ms, L2CAP errors, ring underruns/overruns, and disconnects are marked
 as anomalies.
 
+The firmware also emits `AUDIO_SEND_DELAY_WARNING` when one of these
+send-path gaps exceeds 50 ms:
+
+- SDU generation to `AUDIO_SEND_REQUESTED`;
+- request to `AUDIO_CAN_SEND_NOW_RECEIVED`;
+- callback to `AUDIO_L2CAP_SEND_BEGIN`;
+- previous successful L2CAP call to the next request.
+
+`AUDIO_L2CAP_SEND_COMPLETE` is emitted after the synchronous `l2cap_send()`
+call and contains its result and call duration. To cap normal-path overhead,
+`AUDIO_SEND_STATE_CHANGED` is reserved for exceptional transitions such as
+local recovery and disconnect/reset; the normal state progression is already
+represented by the request, callback, send-begin, send-complete, and
+packet-sent records.
+
 Trace version 1 keeps the original 40-byte record and 92-byte snapshot wire
 layouts. Runtime diagnostics are sent as optional payload kind 3 and merged by
 the parser with the snapshot at the same timestamp. Its fields are:
@@ -64,3 +79,35 @@ Event IDs 19-25 are `AUDIO_TX_STALE_DROP`, `HCI_WRITE_BEGIN`,
 `CYW43_LOCK_HELD`, and `RSSI_CONTEXT`. Begin/end and lock events are emitted
 only for slow operations; normal calls update aggregates without filling the
 trace ring.
+
+Event IDs 26-39 add the precise stall/lifecycle diagnostics:
+
+- `AUDIO_L2CAP_SEND_BEGIN`, `AUDIO_SEND_STATE_CHANGED`, and
+  `AUDIO_SEND_DELAY_WARNING`;
+- `AUDIO_STALE_FRAMES_DROPPED`, `AUDIO_STALE_DROP_CONTEXT`, and
+  `AUDIO_SEQUENCE_SKIP_COUNT_CHANGED`;
+- `HCI_CONNECTION_OPENED`, `HCI_DISCONNECTION_COMPLETE`,
+  `L2CAP_CHANNEL_OPENED`, `L2CAP_CHANNEL_CLOSED`,
+  `ASHA_DEVICE_CONNECTED`, and `ASHA_DEVICE_DISCONNECTED`;
+- `SYSTEM_BOOT` and `WATCHDOG_RESET_REQUESTED`.
+
+Stale recovery uses two records with the same timestamp so the version-1
+40-byte wire record remains unchanged. `AUDIO_STALE_FRAMES_DROPPED` captures
+the pre-drop read/write indices, occupancy, busy state/duration, old/new
+sequences, dropped count, and sequence-skip total. Its companion context adds
+CAN_SEND request state, request/send ages, PCM state, connected-device count,
+and available credits. The parser expands both records into labelled `details`
+fields.
+
+Lifecycle records pack the six-byte Bluetooth address plus HCI status/reason
+and L2CAP status (or `unavailable`) while retaining handle and CID in their
+normal columns. `SYSTEM_BOOT` reports the watchdog flags, raw SDK watchdog
+reset reason, a watchdog-scratch-backed session counter, firmware version,
+and timer-based uptime. A pre-reset watchdog record is best-effort because the
+existing 10-ms reset delay is intentionally unchanged; the following boot
+record's `watchdog_enable_reboot` flag remains authoritative.
+
+The timeline generator treats sequence bytes as per-generation values, not
+global IDs. It associates requests using timestamp/order and the encoder ring
+write index, maintains an extended sequence counter, and therefore preserves
+sequence `255` across `254 -> 255 -> 0`.

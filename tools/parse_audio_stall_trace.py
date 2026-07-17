@@ -20,6 +20,7 @@ ASHA_TYPE_AUDIO_TRACE = 7
 INVALID_HANDLE = 0xFFFF
 INVALID_SEQUENCE = 0xFF
 ANOMALY_US = 25_000
+SEND_DELAY_WARNING_US = 50_000
 RING_CAPACITY = 8
 
 PICO_HEADER = struct.Struct("<BBHI")
@@ -34,9 +35,9 @@ PAYLOAD_RUNTIME_SNAPSHOT = 3
 
 EVENT_NAMES = {
     1: "AUDIO_SDU_GENERATED",
-    2: "AUDIO_CAN_SEND_REQUESTED",
-    3: "AUDIO_CAN_SEND_NOW",
-    4: "AUDIO_L2CAP_SEND",
+    2: "AUDIO_SEND_REQUESTED",
+    3: "AUDIO_CAN_SEND_NOW_RECEIVED",
+    4: "AUDIO_L2CAP_SEND_COMPLETE",
     5: "AUDIO_PACKET_SENT",
     6: "AUDIO_BUSY_SET",
     7: "AUDIO_BUSY_CLEAR",
@@ -58,6 +59,50 @@ EVENT_NAMES = {
     23: "CYW43_LOCK_ACQUIRED",
     24: "CYW43_LOCK_HELD",
     25: "RSSI_CONTEXT",
+    26: "AUDIO_L2CAP_SEND_BEGIN",
+    27: "AUDIO_SEND_STATE_CHANGED",
+    28: "AUDIO_SEND_DELAY_WARNING",
+    29: "AUDIO_STALE_FRAMES_DROPPED",
+    30: "AUDIO_STALE_DROP_CONTEXT",
+    31: "AUDIO_SEQUENCE_SKIP_COUNT_CHANGED",
+    32: "HCI_CONNECTION_OPENED",
+    33: "HCI_DISCONNECTION_COMPLETE",
+    34: "L2CAP_CHANNEL_OPENED",
+    35: "L2CAP_CHANNEL_CLOSED",
+    36: "ASHA_DEVICE_CONNECTED",
+    37: "ASHA_DEVICE_DISCONNECTED",
+    38: "SYSTEM_BOOT",
+    39: "WATCHDOG_RESET_REQUESTED",
+}
+
+DELAY_NAMES = {
+    1: "sdu_generated_to_send_requested",
+    2: "send_requested_to_can_send_now",
+    3: "can_send_now_to_l2cap_send",
+    4: "previous_successful_send_to_next_request",
+}
+
+TX_STATE_NAMES = {
+    0: "Idle",
+    1: "WaitingCanSendNow",
+    2: "WaitingPacketSent",
+}
+
+TX_STATE_REASON_NAMES = {
+    1: "local_recovery",
+    2: "disconnect",
+    3: "reset",
+}
+
+WATCHDOG_REASON_NAMES = {
+    1: "hci_dump_setting",
+    2: "restart_command",
+    3: "usb_setting",
+}
+
+SEQUENCE_EVENT_TYPES = {
+    1, 2, 3, 4, 5, 6, 7, 12, 16, 17, 18, 19,
+    26, 27, 28, 29, 30, 31,
 }
 
 SNAPSHOT_FIELDS = (
@@ -144,10 +189,19 @@ class TimelineRow:
     requested_us: int | None = None
     can_send_now_us: int | None = None
     send_us: int | None = None
+    send_complete_us: int | None = None
     packet_sent_us: int | None = None
     l2cap_result: int | None = None
     ring_fill_at_request: int | None = None
     sequence_unwrapped: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class GeneratedFrame:
+    timestamp_us: int
+    write_index: int
+    sequence: int
+    sequence_unwrapped: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -291,6 +345,16 @@ def anomaly_reasons(record: TraceRecord) -> list[str]:
         reasons.append("audio_tx_reconnect")
     if record.event_type == 19:
         reasons.append("audio_tx_stale_drop")
+    if record.event_type == 28:
+        reasons.append("audio_send_delay_gt_50ms")
+    if record.event_type == 29:
+        reasons.append("audio_stale_frames_dropped")
+    if record.event_type == 31:
+        reasons.append("audio_sequence_skip_count_changed")
+    if record.event_type == 33:
+        reasons.append("hci_disconnect")
+    if record.event_type == 35:
+        reasons.append("l2cap_channel_closed")
     if record.event_type == 21:
         reasons.append("hci_write_slow")
     if record.event_type == 23:
@@ -303,8 +367,17 @@ def anomaly_reasons(record: TraceRecord) -> list[str]:
 
 
 def event_details(record: TraceRecord) -> str:
+    if record.event_type == 2:
+        generated_age = "unknown" if record.duration_us == 0xFFFFFFFF else record.duration_us
+        previous_send_age = "unknown" if record.detail0 == 0xFFFFFFFF else record.detail0
+        return (f"sdu_generated_to_request_us={generated_age};"
+                f"previous_successful_send_to_request_us={previous_send_age};"
+                f"selected_ring_index={record.detail1}")
+    if record.event_type == 3:
+        return f"request_to_can_send_now_us={record.duration_us}"
     if record.event_type == 4:
-        return f"sdu_size={record.detail0}"
+        return (f"sdu_size={record.detail0};"
+                f"l2cap_call_duration_us={record.duration_us}")
     if record.event_type in (6, 7, 12):
         return f"busy_context={record.result}"
     if record.event_type == 10:
@@ -338,6 +411,70 @@ def event_details(record: TraceRecord) -> str:
         return f"duration_us={record.duration_us}"
     if record.event_type == 25:
         return f"rssi_dbm={record.result};sample_age_us={record.duration_us}"
+    if record.event_type == 26:
+        return (f"can_send_now_to_l2cap_send_us={record.duration_us};"
+                f"local_recovery={bool(record.detail0 & 1)}")
+    if record.event_type == 27:
+        old_state = TX_STATE_NAMES.get(record.detail0, str(record.detail0))
+        new_state = TX_STATE_NAMES.get(record.detail1, str(record.detail1))
+        reason = TX_STATE_REASON_NAMES.get(record.result, str(record.result))
+        return (f"old_state={old_state};new_state={new_state};reason={reason};"
+                f"old_state_duration_us={record.duration_us}")
+    if record.event_type == 28:
+        stage = DELAY_NAMES.get(record.result, f"unknown_{record.result}")
+        return (f"delay={stage};delay_us={record.duration_us};"
+                f"threshold_us={record.detail0}")
+    if record.event_type == 29:
+        return (f"old_sequence={record.sequence};new_sequence={record.result & 0xff};"
+                f"dropped_frames={record.detail0};"
+                f"sequence_skip_count={record.detail1};"
+                f"audio_busy_duration_us={record.duration_us}")
+    if record.event_type == 30:
+        flags = record.detail1 >> 24
+        last_request_age = "unknown" if record.duration_us == 0xFFFFFFFF else record.duration_us
+        last_send_age = "unknown" if record.detail0 == 0xFFFFFFFF else record.detail0
+        return (f"last_send_request_age_us={last_request_age};"
+                f"last_successful_l2cap_send_age_us={last_send_age};"
+                f"available_audio_credits={record.detail1 & 0xffff};"
+                f"connected_asha_devices={(record.detail1 >> 16) & 0xff};"
+                f"can_send_now_request_pending={bool(flags & 1)};"
+                f"pcm_streaming={bool(flags & 2)}")
+    if record.event_type == 31:
+        return (f"old_sequence={record.result & 0xff};new_sequence={record.sequence};"
+                f"skipped_frames={record.detail0};"
+                f"sequence_skip_count={record.detail1}")
+    if record.event_type in (32, 33, 34, 35, 36, 37):
+        address_bytes = (
+            record.detail0 & 0xff,
+            (record.detail0 >> 8) & 0xff,
+            (record.detail0 >> 16) & 0xff,
+            (record.detail0 >> 24) & 0xff,
+            record.detail1 & 0xff,
+            (record.detail1 >> 8) & 0xff,
+        )
+        address = ":".join(f"{byte:02X}" for byte in address_bytes)
+        hci_status = (record.detail1 >> 16) & 0xff
+        hci_reason = (record.detail1 >> 24) & 0xff
+        l2cap_status = record.result & 0xff
+        unavailable = 0xff
+        return (f"address={address};"
+                f"hci_status={'unavailable' if hci_status == unavailable else f'0x{hci_status:02x}'};"
+                f"hci_reason={'unavailable' if hci_reason == unavailable else f'0x{hci_reason:02x}'};"
+                f"l2cap_status={'unavailable' if l2cap_status == unavailable else f'0x{l2cap_status:02x}'}")
+    if record.event_type == 38:
+        major = (record.detail1 >> 24) & 0xff
+        minor = (record.detail1 >> 16) & 0xff
+        patch = record.detail1 & 0xffff
+        return (f"watchdog_reboot={bool(record.sequence & 1)};"
+                f"watchdog_enable_reboot={bool(record.sequence & 2)};"
+                f"reset_reason=0x{record.result & 0xffffffff:08x};"
+                f"boot_session_id={record.detail0};"
+                f"firmware_version={major}.{minor}.{patch};"
+                f"uptime_us={record.timestamp_us}")
+    if record.event_type == 39:
+        reason = WATCHDOG_REASON_NAMES.get(record.detail0, str(record.detail0))
+        return (f"reason={reason};delay_us={record.duration_us};"
+                f"boot_session_id={record.detail1}")
     return ""
 
 
@@ -350,7 +487,12 @@ def records_as_rows(records: Iterable[TraceRecord]) -> Iterator[dict[str, object
             "event": record.event,
             "connection_handle": f"0x{record.connection_handle:04x}",
             "l2cap_cid": f"0x{record.l2cap_cid:04x}",
-            "sequence": "" if record.sequence == INVALID_SEQUENCE else record.sequence,
+            # 0xff is both the legacy no-sequence sentinel and a valid 8-bit
+            # audio sequence. Event context disambiguates it.
+            "sequence": (record.sequence
+                         if record.event_type in SEQUENCE_EVENT_TYPES
+                         else "" if record.sequence == INVALID_SEQUENCE
+                         else record.sequence),
             "write_index": record.write_index,
             "read_index": record.read_index,
             "ring_fill": record.ring_fill,
@@ -366,53 +508,128 @@ def records_as_rows(records: Iterable[TraceRecord]) -> Iterator[dict[str, object
 
 
 def build_timeline(records: Sequence[TraceRecord]) -> list[TimelineRow]:
-    generated: dict[int, list[int]] = defaultdict(list)
+    generated: dict[int, list[GeneratedFrame]] = defaultdict(list)
     current: dict[tuple[int, int], TimelineRow] = {}
     timeline: list[TimelineRow] = []
+    previous_generated_sequence: int | None = None
+    previous_generated_unwrapped: int | None = None
+
+    def find_generated(sequence: int, timestamp_us: int,
+                       expected_write_index: int | None = None) -> GeneratedFrame | None:
+        candidates = generated.get(sequence, [])
+        if expected_write_index is not None:
+            exact = next(
+                (frame for frame in reversed(candidates)
+                 if frame.timestamp_us <= timestamp_us and
+                 frame.write_index == expected_write_index),
+                None,
+            )
+            if exact is not None:
+                return exact
+        return next(
+            (frame for frame in reversed(candidates)
+             if frame.timestamp_us <= timestamp_us),
+            None,
+        )
+
+    def rebind_row(row: TimelineRow, sequence: int, timestamp_us: int,
+                   expected_write_index: int | None) -> None:
+        frame = find_generated(sequence, timestamp_us, expected_write_index)
+        row.sequence = sequence
+        if frame is not None:
+            row.generated_us = frame.timestamp_us
+            row.sequence_unwrapped = frame.sequence_unwrapped
 
     for record in sorted(records, key=lambda item: item.timestamp_us):
-        if record.event_type == 1 and record.sequence != INVALID_SEQUENCE:
-            generated[record.sequence].append(record.timestamp_us)
+        if record.event_type == 1:
+            if previous_generated_sequence is None:
+                sequence_unwrapped = record.sequence
+            else:
+                forward = (record.sequence - previous_generated_sequence) & 0xFF
+                if forward == 0:
+                    sequence_unwrapped = previous_generated_unwrapped
+                elif forward < 128:
+                    sequence_unwrapped = previous_generated_unwrapped + forward
+                else:
+                    # Preserve capture order for a rare out-of-order record
+                    # without treating the raw byte as globally unique.
+                    sequence_unwrapped = previous_generated_unwrapped + 1
+            frame = GeneratedFrame(
+                timestamp_us=record.timestamp_us,
+                write_index=record.write_index,
+                sequence=record.sequence,
+                sequence_unwrapped=sequence_unwrapped,
+            )
+            generated[record.sequence].append(frame)
+            previous_generated_sequence = record.sequence
+            previous_generated_unwrapped = sequence_unwrapped
             continue
         if record.connection_handle == INVALID_HANDLE:
             continue
         key = (record.connection_handle, record.l2cap_cid)
         if record.event_type == 2:
-            generated_us = next(
-                (timestamp for timestamp in reversed(generated.get(record.sequence, []))
-                 if timestamp <= record.timestamp_us),
-                None,
-            )
+            # At request time curr_read_index has already advanced past the
+            # selected frame, so it equals that frame's generation write index.
+            frame = find_generated(record.sequence, record.timestamp_us,
+                                   record.read_index)
             row = TimelineRow(
                 connection_handle=record.connection_handle,
                 l2cap_cid=record.l2cap_cid,
                 sequence=record.sequence,
-                generated_us=generated_us,
+                generated_us=None if frame is None else frame.timestamp_us,
                 requested_us=record.timestamp_us,
                 ring_fill_at_request=record.ring_fill,
+                sequence_unwrapped=(None if frame is None
+                                    else frame.sequence_unwrapped),
             )
             timeline.append(row)
             current[key] = row
             continue
         row = current.get(key)
-        if row is None or row.sequence != record.sequence:
+        if row is None:
             continue
+        if record.event_type in (19, 29) and row.sequence == record.sequence:
+            new_sequence = ((record.detail1 if record.event_type == 19
+                             else record.result) & 0xFF)
+            rebind_row(row, new_sequence, record.timestamp_us,
+                       record.write_index)
+            continue
+        if row.sequence != record.sequence:
+            # If a stale-drop context record was lost, the first send record
+            # still identifies the replacement frame. Rebind by generation
+            # order/write index instead of dropping sequence 255 or attaching
+            # a wrapped byte to an older packet.
+            if record.event_type in (4, 26) and row.send_us is None:
+                rebind_row(row, record.sequence, record.timestamp_us,
+                           record.write_index)
+            else:
+                continue
         if record.event_type == 3:
             row.can_send_now_us = record.timestamp_us
-        elif record.event_type == 4:
+        elif record.event_type == 26:
             row.send_us = record.timestamp_us
+        elif record.event_type == 4:
+            if row.send_us is None:
+                row.send_us = record.timestamp_us
+            row.send_complete_us = record.timestamp_us
             row.l2cap_result = record.result
         elif record.event_type == 5:
             row.packet_sent_us = record.timestamp_us
 
+    # Truncated captures can omit the matching SDU_GENERATED record. Keep their
+    # extended sequence monotonic per connection using request order as fallback.
     unwrap_state: dict[tuple[int, int], tuple[int, int]] = {}
     for row in timeline:
         key = (row.connection_handle, row.l2cap_cid)
-        epoch, previous = unwrap_state.get(key, (0, row.sequence))
-        if row.sequence < previous and previous - row.sequence > 128:
-            epoch += 256
-        row.sequence_unwrapped = epoch + row.sequence
-        unwrap_state[key] = (epoch, row.sequence)
+        if row.sequence_unwrapped is None:
+            previous_raw, previous_extended = unwrap_state.get(
+                key, (row.sequence, row.sequence)
+            )
+            forward = (row.sequence - previous_raw) & 0xFF
+            row.sequence_unwrapped = (previous_extended + forward
+                                      if forward < 128 else
+                                      previous_extended + 1)
+        unwrap_state[key] = (row.sequence, row.sequence_unwrapped)
     return timeline
 
 
@@ -422,15 +639,20 @@ def elapsed(end: int | None, start: int | None) -> int | None:
 
 def timeline_as_rows(timeline: Iterable[TimelineRow]) -> Iterator[dict[str, object]]:
     for row in timeline:
+        generated_to_request = elapsed(row.requested_us, row.generated_us)
         generated_to_can = elapsed(row.can_send_now_us, row.generated_us)
         request_to_can = elapsed(row.can_send_now_us, row.requested_us)
         can_to_send = elapsed(row.send_us, row.can_send_now_us)
-        send_to_packet = elapsed(row.packet_sent_us, row.send_us)
+        l2cap_call = elapsed(row.send_complete_us, row.send_us)
+        send_to_packet = elapsed(row.packet_sent_us,
+                                 row.send_complete_us or row.send_us)
         total = elapsed(row.packet_sent_us, row.generated_us)
         reasons = []
         for label, value in (
+            ("generated_to_send_requested_gt_25ms", generated_to_request),
             ("generated_to_can_send_now_gt_25ms", generated_to_can),
             ("request_to_can_send_now_gt_25ms", request_to_can),
+            ("can_send_now_to_l2cap_send_gt_25ms", can_to_send),
             ("send_to_packet_sent_gt_25ms", send_to_packet),
         ):
             if value is not None and value > ANOMALY_US:
@@ -446,10 +668,14 @@ def timeline_as_rows(timeline: Iterable[TimelineRow]) -> Iterator[dict[str, obje
             "can_send_requested_us": row.requested_us,
             "can_send_now_us": row.can_send_now_us,
             "l2cap_send_us": row.send_us,
+            "l2cap_send_begin_us": row.send_us,
+            "l2cap_send_complete_us": row.send_complete_us,
             "packet_sent_us": row.packet_sent_us,
+            "generated_to_send_requested_us": generated_to_request,
             "generated_to_can_send_now_us": generated_to_can,
             "request_to_can_send_now_us": request_to_can,
             "can_send_now_to_send_us": can_to_send,
+            "l2cap_call_duration_us": l2cap_call,
             "send_to_packet_sent_us": send_to_packet,
             "generated_to_packet_sent_us": total,
             "ring_fill_at_request": row.ring_fill_at_request,
@@ -469,7 +695,9 @@ def snapshot_as_rows(snapshots: Iterable[TraceSnapshot]) -> Iterator[dict[str, o
 
 
 def pre_disconnect_as_rows(records: Sequence[TraceRecord]) -> Iterator[dict[str, object]]:
-    disconnects = [record for record in records if record.event_type == 10]
+    disconnects = [record for record in records if record.event_type == 33]
+    if not disconnects:
+        disconnects = [record for record in records if record.event_type == 10]
     for disconnect_number, disconnect in enumerate(disconnects, start=1):
         window_start = max(0, disconnect.timestamp_us - 5_000_000)
         for row in records_as_rows(

@@ -7,6 +7,8 @@
 
 #include <pico/multicore.h>
 #include <pico/time.h>
+#include <hardware/structs/watchdog.h>
+#include <hardware/watchdog.h>
 
 #include "asha_audio.h"
 
@@ -14,6 +16,13 @@
 #define TRACE_RING_MASK (TRACE_RING_SIZE - 1u)
 #define TRACE_CONSUMER_SLOTS 2u
 #define TRACE_CONNECTION_SLOTS 2u
+#define TRACE_BOOT_SESSION_MAGIC 0x41535452u
+
+#ifndef PICO_ASHA_FW_VERS_MAJOR
+#define PICO_ASHA_FW_VERS_MAJOR 0u
+#define PICO_ASHA_FW_VERS_MINOR 0u
+#define PICO_ASHA_FW_VERS_PATCH 0u
+#endif
 
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "Trace ring indices must be lock-free");
 
@@ -33,6 +42,17 @@ typedef struct TraceConnectionState {
     atomic_uint_least32_t rssi_sample_us;
     atomic_bool have_rssi;
 } TraceConnectionState;
+
+typedef struct TraceSduGenerationState {
+    atomic_uint_least32_t write_index;
+    atomic_uint_least32_t generated_us;
+} TraceSduGenerationState;
+
+typedef struct TraceSequenceSkip {
+    uint8_t previous_sequence;
+    uint32_t skipped_frames;
+    uint32_t total_skipped_frames;
+} TraceSequenceSkip;
 
 typedef struct TraceCounters {
     atomic_uint_least32_t sdu_generated_count;
@@ -85,6 +105,8 @@ static TraceConnectionState connection_state[TRACE_CONNECTION_SLOTS];
 static atomic_uint_least32_t last_sdu_generated_us;
 static atomic_uint_least32_t last_audio_timer_us;
 static atomic_uint_least32_t last_acl_hci_write_end_us;
+static TraceSduGenerationState sdu_generation[ASHA_G722_RING_SIZE];
+static uint32_t boot_session_id;
 
 static uint32_t saturating_us(uint64_t value)
 {
@@ -187,6 +209,52 @@ static void emit_record(uint8_t event_type, uint16_t handle, uint16_t cid, uint8
                    read_index, busy, duration_us, detail0, detail1, result);
 }
 
+static void emit_send_delay_warning(uint16_t handle, uint16_t cid, uint8_t sequence,
+                                    uint32_t write_index, uint32_t read_index, bool busy,
+                                    uint8_t delay_kind, uint32_t delay_us)
+{
+    if (delay_us == UINT32_MAX ||
+        delay_us <= AUDIO_STALL_TRACE_SEND_DELAY_WARNING_US) return;
+    emit_record(AUDIO_STALL_TRACE_SEND_DELAY_WARNING, handle, cid, sequence,
+                write_index, read_index, busy, delay_us,
+                AUDIO_STALL_TRACE_SEND_DELAY_WARNING_US, 0u, delay_kind);
+}
+
+static uint32_t sdu_to_request_us(uint32_t selected_ring_index, uint64_t now_us)
+{
+    uint32_t expected_write_index = selected_ring_index + 1u;
+    TraceSduGenerationState *state =
+        &sdu_generation[selected_ring_index & ASHA_G722_RING_SIZE_MASK];
+    uint32_t recorded_write_index = atomic_load_explicit(&state->write_index,
+                                                          memory_order_acquire);
+    if (recorded_write_index != expected_write_index) return UINT32_MAX;
+    uint32_t generated_us = atomic_load_explicit(&state->generated_us,
+                                                 memory_order_relaxed);
+    uint32_t elapsed = (uint32_t)now_us - generated_us;
+    return elapsed > INT32_MAX ? UINT32_MAX : elapsed;
+}
+
+static uint32_t pack_address_low(const uint8_t address[6])
+{
+    if (address == NULL) return 0u;
+    return (uint32_t)address[0] |
+           ((uint32_t)address[1] << 8u) |
+           ((uint32_t)address[2] << 16u) |
+           ((uint32_t)address[3] << 24u);
+}
+
+static uint32_t pack_address_and_hci_status(const uint8_t address[6],
+                                            uint8_t hci_status,
+                                            uint8_t hci_reason)
+{
+    uint32_t address_high = address == NULL
+                                ? 0u
+                                : (uint32_t)address[4] |
+                                      ((uint32_t)address[5] << 8u);
+    return address_high | ((uint32_t)hci_status << 16u) |
+           ((uint32_t)hci_reason << 24u);
+}
+
 static TraceConnectionState *get_connection_state(uint16_t handle, bool create)
 {
     TraceConnectionState *empty = NULL;
@@ -211,21 +279,34 @@ static bool any_audio_busy(void)
     return false;
 }
 
-static void note_sequence_sent(uint16_t handle, uint8_t sequence)
+static TraceSequenceSkip note_sequence_sent(uint16_t handle, uint8_t sequence)
 {
+    TraceSequenceSkip skip = {
+        .previous_sequence = AUDIO_STALL_TRACE_INVALID_SEQUENCE,
+        .skipped_frames = 0u,
+        .total_skipped_frames = atomic_load_explicit(
+            &counters.sequence_skip_count, memory_order_relaxed),
+    };
     TraceConnectionState *state = get_connection_state(handle, true);
     if (state != NULL) {
         if (atomic_load_explicit(&state->have_sequence, memory_order_relaxed)) {
             uint8_t last = (uint8_t)atomic_load_explicit(&state->last_sequence, memory_order_relaxed);
+            skip.previous_sequence = last;
             uint8_t delta = (uint8_t)(sequence - last);
             if (delta > 1u && delta < 128u) {
-                atomic_fetch_add_explicit(&counters.sequence_skip_count, delta - 1u, memory_order_relaxed);
+                skip.skipped_frames = delta - 1u;
+                skip.total_skipped_frames = atomic_fetch_add_explicit(
+                                                &counters.sequence_skip_count,
+                                                skip.skipped_frames,
+                                                memory_order_relaxed) +
+                                            skip.skipped_frames;
             }
         }
         atomic_store_explicit(&state->last_sequence, sequence, memory_order_relaxed);
         atomic_store_explicit(&state->have_sequence, true, memory_order_relaxed);
     }
     atomic_store_explicit(&counters.sequence_sent, sequence, memory_order_relaxed);
+    return skip;
 }
 
 void audio_stall_trace_init(void)
@@ -241,10 +322,39 @@ void audio_stall_trace_init(void)
         atomic_store_explicit(&connection_state[i].handle,
                               AUDIO_STALL_TRACE_INVALID_HANDLE, memory_order_relaxed);
     }
+    for (uint32_t i = 0; i < ASHA_G722_RING_SIZE; ++i) {
+        atomic_store_explicit(&sdu_generation[i].write_index, UINT32_MAX,
+                              memory_order_relaxed);
+        atomic_store_explicit(&sdu_generation[i].generated_us, 0u,
+                              memory_order_relaxed);
+    }
     atomic_store_explicit(&counters.ring_fill_min, UINT32_MAX, memory_order_relaxed);
     atomic_store_explicit(&last_sdu_generated_us, 0u, memory_order_relaxed);
     atomic_store_explicit(&last_audio_timer_us, 0u, memory_order_relaxed);
     atomic_store_explicit(&last_acl_hci_write_end_us, 0u, memory_order_relaxed);
+
+    bool watchdog_reboot = watchdog_caused_reboot();
+    bool watchdog_enable_reboot = watchdog_enable_caused_reboot();
+    uint32_t reset_reason = watchdog_hw->reason;
+    if (watchdog_hw->scratch[2] == TRACE_BOOT_SESSION_MAGIC) {
+        boot_session_id = watchdog_hw->scratch[3] + 1u;
+        if (boot_session_id == 0u) boot_session_id = 1u;
+    } else {
+        boot_session_id = 1u;
+    }
+    watchdog_hw->scratch[2] = TRACE_BOOT_SESSION_MAGIC;
+    watchdog_hw->scratch[3] = boot_session_id;
+
+    uint32_t firmware_version =
+        ((uint32_t)PICO_ASHA_FW_VERS_MAJOR << 24u) |
+        ((uint32_t)PICO_ASHA_FW_VERS_MINOR << 16u) |
+        ((uint32_t)PICO_ASHA_FW_VERS_PATCH & 0xffffu);
+    uint8_t boot_flags = (watchdog_reboot ? 1u : 0u) |
+                         (watchdog_enable_reboot ? 2u : 0u);
+    emit_record(AUDIO_STALL_TRACE_SYSTEM_BOOT,
+                AUDIO_STALL_TRACE_INVALID_HANDLE, 0u, boot_flags,
+                0u, 0u, false, 0u, boot_session_id, firmware_version,
+                (int32_t)reset_reason);
 }
 
 uint64_t audio_stall_trace_now_us(void)
@@ -272,6 +382,13 @@ void audio_stall_trace_sdu_generated(uint8_t sequence, uint32_t write_index)
     uint32_t now_us_low = (uint32_t)now_us;
     uint32_t previous_us = atomic_exchange_explicit(&last_sdu_generated_us, now_us_low, memory_order_acq_rel);
     uint32_t interval_us = previous_us == 0u ? 0u : now_us_low - previous_us;
+    uint32_t generated_ring_index = write_index - 1u;
+    TraceSduGenerationState *generation =
+        &sdu_generation[generated_ring_index & ASHA_G722_RING_SIZE_MASK];
+    atomic_store_explicit(&generation->generated_us, now_us_low,
+                          memory_order_relaxed);
+    atomic_store_explicit(&generation->write_index, write_index,
+                          memory_order_release);
     uint32_t read_index = slowest_consumer_read_index(write_index);
     uint8_t fill = ring_fill(write_index, read_index);
     atomic_fetch_add_explicit(&counters.sdu_generated_count, 1u, memory_order_relaxed);
@@ -287,10 +404,23 @@ void audio_stall_trace_sdu_generated(uint8_t sequence, uint32_t write_index)
 }
 
 void audio_stall_trace_can_send_requested(uint16_t handle, uint16_t cid, uint8_t sequence,
-                                          uint32_t write_index, uint32_t read_index, bool busy)
+                                          uint32_t write_index, uint32_t read_index, bool busy,
+                                          uint32_t selected_ring_index,
+                                          uint32_t previous_send_age_us)
 {
+    uint64_t now_us = time_us_64();
+    uint32_t generation_to_request_us = sdu_to_request_us(selected_ring_index,
+                                                          now_us);
     emit_record(AUDIO_STALL_TRACE_CAN_SEND_REQUESTED, handle, cid, sequence,
-                write_index, read_index, busy, 0u, 0u, 0u, 0);
+                write_index, read_index, busy, generation_to_request_us,
+                previous_send_age_us, selected_ring_index, 0);
+    emit_send_delay_warning(handle, cid, sequence, write_index, read_index,
+                            busy, AUDIO_STALL_TRACE_DELAY_SDU_TO_REQUEST,
+                            generation_to_request_us);
+    emit_send_delay_warning(handle, cid, sequence, write_index, read_index,
+                            busy,
+                            AUDIO_STALL_TRACE_DELAY_PREVIOUS_SEND_TO_REQUEST,
+                            previous_send_age_us);
 }
 
 void audio_stall_trace_can_send_now(uint16_t handle, uint16_t cid, uint8_t sequence,
@@ -301,21 +431,49 @@ void audio_stall_trace_can_send_now(uint16_t handle, uint16_t cid, uint8_t seque
     atomic_update_max(&counters.can_send_wait_max_us, wait_us);
     emit_record(AUDIO_STALL_TRACE_CAN_SEND_NOW, handle, cid, sequence,
                 write_index, read_index, busy, wait_us, 0u, 0u, 0);
+    emit_send_delay_warning(handle, cid, sequence, write_index, read_index,
+                            busy,
+                            AUDIO_STALL_TRACE_DELAY_REQUEST_TO_CAN_SEND_NOW,
+                            wait_us);
+}
+
+void audio_stall_trace_l2cap_send_begin(uint16_t handle, uint16_t cid,
+                                        uint8_t sequence,
+                                        uint32_t write_index,
+                                        uint32_t read_index, bool busy,
+                                        uint32_t can_send_now_to_send_us,
+                                        bool local_recovery)
+{
+    emit_record(AUDIO_STALL_TRACE_L2CAP_SEND_BEGIN, handle, cid, sequence,
+                write_index, read_index, busy, can_send_now_to_send_us,
+                local_recovery ? 1u : 0u, 0u, 0);
+    emit_send_delay_warning(
+        handle, cid, sequence, write_index, read_index, busy,
+        AUDIO_STALL_TRACE_DELAY_CAN_SEND_NOW_TO_L2CAP_SEND,
+        can_send_now_to_send_us);
 }
 
 void audio_stall_trace_l2cap_send(uint16_t handle, uint16_t cid, uint8_t sequence,
                                   uint32_t write_index, uint32_t read_index, bool busy,
-                                  uint16_t sdu_size, int32_t result)
+                                  uint16_t sdu_size, uint32_t call_duration_us,
+                                  int32_t result)
 {
     atomic_fetch_add_explicit(&counters.l2cap_send_attempt_count, 1u, memory_order_relaxed);
     if (result == 0) {
         atomic_fetch_add_explicit(&counters.l2cap_send_success_count, 1u, memory_order_relaxed);
-        note_sequence_sent(handle, sequence);
+        TraceSequenceSkip skip = note_sequence_sent(handle, sequence);
+        if (skip.skipped_frames != 0u) {
+            emit_record(AUDIO_STALL_TRACE_SEQUENCE_SKIP_COUNT_CHANGED,
+                        handle, cid, sequence, write_index, read_index, busy,
+                        0u, skip.skipped_frames, skip.total_skipped_frames,
+                        skip.previous_sequence);
+        }
     } else {
         atomic_fetch_add_explicit(&counters.l2cap_send_error_count, 1u, memory_order_relaxed);
     }
     emit_record(AUDIO_STALL_TRACE_L2CAP_SEND, handle, cid, sequence,
-                write_index, read_index, busy, 0u, sdu_size, 0u, result);
+                write_index, read_index, busy, call_duration_us, sdu_size, 0u,
+                result);
 }
 
 void audio_stall_trace_packet_sent(uint16_t handle, uint16_t cid, uint8_t sequence,
@@ -496,6 +654,77 @@ void audio_stall_trace_tx_stale_drop(uint16_t handle, uint16_t cid,
                 new_sequence, 0);
 }
 
+void audio_stall_trace_stale_frames_dropped(
+    uint16_t handle, uint16_t cid, uint8_t old_sequence, uint8_t new_sequence,
+    uint32_t write_index, uint32_t read_index, bool busy,
+    uint32_t busy_duration_us, uint32_t dropped_frames,
+    bool can_send_now_pending, uint32_t last_request_age_us,
+    uint32_t last_successful_send_age_us, bool pcm_streaming,
+    uint8_t connected_devices, uint16_t available_credits)
+{
+    uint64_t now_us = time_us_64();
+    uint32_t total_sequence_skips = atomic_load_explicit(
+        &counters.sequence_skip_count, memory_order_relaxed);
+    atomic_fetch_add_explicit(&runtime_counters.tx_stale_drop_count, 1u,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&runtime_counters.tx_stale_drop_frames,
+                              dropped_frames, memory_order_relaxed);
+
+    /* Primary record: pre-drop indices/fill/busy, busy age, both sequences,
+     * dropped-frame count, and the sequence-skip total at capture time. */
+    emit_record_at(now_us, AUDIO_STALL_TRACE_STALE_FRAMES_DROPPED,
+                   handle, cid, old_sequence, write_index, read_index, busy,
+                   busy_duration_us, dropped_frames, total_sequence_skips,
+                   new_sequence);
+
+    /* Companion record at the identical timestamp carries timing and runtime
+     * state without expanding the fixed 40-byte version-1 wire record. */
+    uint8_t flags = (can_send_now_pending ? 1u : 0u) |
+                    (pcm_streaming ? 2u : 0u);
+    uint32_t packed_state = (uint32_t)available_credits |
+                            ((uint32_t)connected_devices << 16u) |
+                            ((uint32_t)flags << 24u);
+    emit_record_at(now_us, AUDIO_STALL_TRACE_STALE_DROP_CONTEXT,
+                   handle, cid, new_sequence, write_index, read_index, busy,
+                   last_request_age_us, last_successful_send_age_us,
+                   packed_state, 0);
+}
+
+void audio_stall_trace_send_state_changed(
+    uint16_t handle, uint16_t cid, uint8_t sequence,
+    uint32_t write_index, uint32_t read_index, bool busy,
+    uint8_t old_state, uint8_t new_state, uint8_t reason,
+    uint32_t old_state_duration_us)
+{
+    emit_record(AUDIO_STALL_TRACE_SEND_STATE_CHANGED, handle, cid, sequence,
+                write_index, read_index, busy, old_state_duration_us,
+                old_state, new_state, reason);
+}
+
+void audio_stall_trace_bluetooth_lifecycle(
+    uint8_t event_type, uint16_t handle, uint16_t cid,
+    const uint8_t address[6], uint8_t hci_status, uint8_t hci_reason,
+    uint8_t l2cap_status, uint32_t write_index, uint32_t read_index,
+    bool busy)
+{
+    emit_record(event_type, handle, cid, AUDIO_STALL_TRACE_INVALID_SEQUENCE,
+                write_index, read_index, busy, 0u,
+                pack_address_low(address),
+                pack_address_and_hci_status(address, hci_status, hci_reason),
+                l2cap_status);
+}
+
+void audio_stall_trace_watchdog_reset_requested(uint8_t reason,
+                                                uint32_t delay_ms)
+{
+    uint32_t write_index = asha_audio_get_write_index();
+    uint32_t read_index = slowest_consumer_read_index(write_index);
+    emit_record(AUDIO_STALL_TRACE_WATCHDOG_RESET_REQUESTED,
+                AUDIO_STALL_TRACE_INVALID_HANDLE, 0u,
+                AUDIO_STALL_TRACE_INVALID_SEQUENCE, write_index, read_index,
+                any_audio_busy(), delay_ms * 1000u, reason, boot_session_id, 0);
+}
+
 void audio_stall_trace_hci_write(uint64_t begin_us, uint64_t end_us,
                                  uint8_t packet_type, int32_t result)
 {
@@ -588,10 +817,18 @@ void audio_stall_trace_snapshot(AudioStallTraceSnapshot *snapshot, uint64_t now_
 {
     if (snapshot == NULL) return;
     uint32_t current_busy_us = 0u;
+    uint32_t now_us_low = (uint32_t)now_us;
     for (uint32_t i = 0; i < TRACE_CONNECTION_SLOTS; ++i) {
         if (!atomic_load_explicit(&connection_state[i].busy, memory_order_acquire)) continue;
         uint32_t since_us = atomic_load_explicit(&connection_state[i].busy_since_us, memory_order_relaxed);
-        uint32_t duration_us = (uint32_t)now_us - since_us;
+        if (!atomic_load_explicit(&connection_state[i].busy, memory_order_acquire)) continue;
+        uint32_t duration_us = now_us_low - since_us;
+        /* The snapshot timestamp is captured on core 0 before these values are
+         * sampled. Core 1 can set busy in between, making since_us newer than
+         * now_us. Treat that observation as a zero-duration/raced sample instead
+         * of turning the unsigned subtraction into UINT32_MAX. Durations longer
+         * than half the 32-bit timer range are not credible audio-busy intervals. */
+        if (duration_us > INT32_MAX) continue;
         if (duration_us > current_busy_us) current_busy_us = duration_us;
         atomic_update_max(&counters.audio_busy_max_duration_us, duration_us);
     }

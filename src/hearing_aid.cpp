@@ -183,6 +183,15 @@ void HearingAid::process()
                 }
                 ha->cached = true;
                 ha->process_state = Audio;
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+                audio_stall_trace_bluetooth_lifecycle(
+                    AUDIO_STALL_TRACE_ASHA_DEVICE_CONNECTED,
+                    ha->conn_handle, ha->cid, ha->addr,
+                    ERROR_CODE_SUCCESS, AUDIO_STALL_TRACE_STATUS_UNAVAILABLE,
+                    ERROR_CODE_SUCCESS, asha_audio_get_write_index(),
+                    ha->curr_read_index,
+                    (ha->audio_state & AudioState::AudioBusy) != 0U);
+#endif
                 if (ha->other && ha->other->is_streaming()) {
                     ha->other->stop_request_from_other = true;
                 }
@@ -490,10 +499,20 @@ void HearingAid::on_disconnected(hci_con_handle_t handle, uint8_t status, uint8_
     uint8_t sequence = ha->trace_last_sequence != AUDIO_STALL_TRACE_INVALID_SEQUENCE
                            ? ha->trace_last_sequence
                            : ha->trace_pending_sequence;
+    audio_stall_trace_bluetooth_lifecycle(
+        AUDIO_STALL_TRACE_HCI_DISCONNECTION_COMPLETE,
+        ha->conn_handle, ha->cid, ha->addr, status, reason,
+        AUDIO_STALL_TRACE_STATUS_UNAVAILABLE, write_index,
+        ha->curr_read_index, busy);
     audio_stall_trace_ble_disconnect(ha->conn_handle, ha->cid, sequence,
                                      write_index, ha->curr_read_index, busy,
                                      status, reason, busy_duration_us,
                                      ha->trace_last_successful_send_us);
+    audio_stall_trace_bluetooth_lifecycle(
+        AUDIO_STALL_TRACE_ASHA_DEVICE_DISCONNECTED,
+        ha->conn_handle, ha->cid, ha->addr, status, reason,
+        AUDIO_STALL_TRACE_STATUS_UNAVAILABLE, write_index,
+        ha->curr_read_index, busy);
     audio_stall_trace_set_consumer(ha == hearing_aids[0] ? 0U : 1U, false,
                                    ha->curr_read_index);
     if (busy) ha->unset_audio_busy(AUDIO_STALL_TRACE_BUSY_CONTEXT_RESET);
@@ -980,6 +999,15 @@ void HearingAid::handle_l2cap_cbm(PACKET_HANDLER_PARAMS)
             handle = l2cap_event_cbm_channel_opened_get_handle(packet);
             bt_status = l2cap_event_cbm_channel_opened_get_status(packet);
             ha = get_by_con_handle(handle);
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+            audio_stall_trace_bluetooth_lifecycle(
+                AUDIO_STALL_TRACE_L2CAP_CHANNEL_OPENED,
+                handle, l2cap_event_cbm_channel_opened_get_local_cid(packet),
+                ha->addr, AUDIO_STALL_TRACE_STATUS_UNAVAILABLE,
+                AUDIO_STALL_TRACE_STATUS_UNAVAILABLE, bt_status,
+                asha_audio_get_write_index(), ha->curr_read_index,
+                (ha->audio_state & AudioState::AudioBusy) != 0U);
+#endif
             if (bt_status != ATT_ERROR_SUCCESS) {
                 //LOG_ERROR("%s: Error creating L2CAP cbm connection: %s", ha->get_side_str(), bt_err_str(att_status));
                 add_event_to_buffer(ha->conn_id, EventPacket(EventType::L2CAPCon, StatusType::L2CapStatus, bt_status));
@@ -1005,6 +1033,30 @@ void HearingAid::handle_l2cap_cbm(PACKET_HANDLER_PARAMS)
 #endif
             }
             break;
+        case L2CAP_EVENT_CHANNEL_CLOSED:
+            cid = l2cap_event_channel_closed_get_local_cid(packet);
+            ha = get_by_cid(cid);
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+            if (ha != nullptr) {
+                audio_stall_trace_bluetooth_lifecycle(
+                    AUDIO_STALL_TRACE_L2CAP_CHANNEL_CLOSED,
+                    ha->conn_handle, cid, ha->addr,
+                    AUDIO_STALL_TRACE_STATUS_UNAVAILABLE,
+                    AUDIO_STALL_TRACE_STATUS_UNAVAILABLE,
+                    AUDIO_STALL_TRACE_STATUS_UNAVAILABLE,
+                    asha_audio_get_write_index(), ha->curr_read_index,
+                    (ha->audio_state & AudioState::AudioBusy) != 0U);
+            } else {
+                audio_stall_trace_bluetooth_lifecycle(
+                    AUDIO_STALL_TRACE_L2CAP_CHANNEL_CLOSED,
+                    HCI_CON_HANDLE_INVALID, cid, nullptr,
+                    AUDIO_STALL_TRACE_STATUS_UNAVAILABLE,
+                    AUDIO_STALL_TRACE_STATUS_UNAVAILABLE,
+                    AUDIO_STALL_TRACE_STATUS_UNAVAILABLE,
+                    asha_audio_get_write_index(), 0U, false);
+            }
+#endif
+            break;
         case L2CAP_EVENT_CAN_SEND_NOW:
             cid = l2cap_event_can_send_now_get_local_cid(packet);
             ha = get_by_cid(cid);
@@ -1022,6 +1074,7 @@ void HearingAid::handle_l2cap_cbm(PACKET_HANDLER_PARAMS)
                                        ? static_cast<uint32_t>(std::min<uint64_t>(
                                              now_us - ha->audio_tx_state_since_us, UINT32_MAX))
                                        : 0U;
+                ha->trace_can_send_now_us = now_us;
                 audio_stall_trace_can_send_now(ha->conn_handle, cid,
                                                ha->audio_tx_sequence,
                                                write_index, ha->curr_read_index,
@@ -1064,7 +1117,6 @@ void HearingAid::handle_l2cap_cbm(PACKET_HANDLER_PARAMS)
                                               ha->curr_read_index,
                                               (ha->audio_state & AudioState::AudioBusy) != 0U,
                                               wait_us);
-                ha->trace_last_successful_send_us = now_us;
                 ha->trace_last_sequence = sequence;
 #endif
                 ha->unset_audio_busy(AUDIO_STALL_TRACE_BUSY_CONTEXT_PACKET_SENT);
@@ -1552,10 +1604,18 @@ bool HearingAid::request_audio_can_send(uint32_t write_index)
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
     trace_pending_sequence = audio_tx_sequence;
     trace_can_send_request_us = now_us;
+    trace_can_send_now_us = 0U;
+    uint32_t previous_send_age_us =
+        trace_last_successful_send_us == 0U || now_us < trace_last_successful_send_us
+            ? UINT32_MAX
+            : static_cast<uint32_t>(std::min<uint64_t>(
+                  now_us - trace_last_successful_send_us, UINT32_MAX));
     // Record the request before the BTstack call because CAN_SEND_NOW may be
     // delivered synchronously from l2cap_request_can_send_now_event().
     audio_stall_trace_can_send_requested(conn_handle, cid, audio_tx_sequence,
-                                         write_index, curr_read_index, true);
+                                         write_index, curr_read_index, true,
+                                         audio_tx_ring_index,
+                                         previous_send_age_us);
 #endif
 
     uint8_t result = l2cap_request_can_send_now_event(cid);
@@ -1576,6 +1636,24 @@ bool HearingAid::send_pending_audio(bool local_recovery, uint32_t write_index)
     uint64_t now_us = time_us_64();
     uint8_t sequence = audio_tx_sequence;
 
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    AudioTxState previous_state = audio_tx_state;
+    uint32_t previous_state_duration_us =
+        now_us > audio_tx_state_since_us
+            ? static_cast<uint32_t>(std::min<uint64_t>(
+                  now_us - audio_tx_state_since_us, UINT32_MAX))
+            : 0U;
+    if (local_recovery) {
+        audio_stall_trace_send_state_changed(
+            conn_handle, cid, sequence, write_index, curr_read_index,
+            (audio_state & AudioState::AudioBusy) != 0U,
+            static_cast<uint8_t>(previous_state),
+            static_cast<uint8_t>(AudioTxState::WaitingPacketSent),
+            AUDIO_STALL_TRACE_STATE_LOCAL_RECOVERY,
+            previous_state_duration_us);
+    }
+#endif
+
     // The phase transition must precede l2cap_send(): BTstack is allowed to
     // make progress synchronously and emit PACKET_SENT from inside the call.
     audio_tx_state = AudioTxState::WaitingPacketSent;
@@ -1587,14 +1665,29 @@ bool HearingAid::send_pending_audio(bool local_recovery, uint32_t write_index)
 
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
     trace_l2cap_send_us = now_us;
+    uint32_t can_send_now_to_send_us =
+        local_recovery || trace_can_send_now_us == 0U || now_us < trace_can_send_now_us
+            ? 0U
+            : static_cast<uint32_t>(std::min<uint64_t>(
+                  now_us - trace_can_send_now_us, UINT32_MAX));
+    audio_stall_trace_l2cap_send_begin(
+        conn_handle, cid, sequence, write_index, curr_read_index,
+        (audio_state & AudioState::AudioBusy) != 0U,
+        can_send_now_to_send_us, local_recovery);
 #endif
     uint8_t result = l2cap_send(cid, audio_data, ASHA_SDU_SIZE_BYTES);
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    uint64_t complete_us = time_us_64();
+    uint32_t call_duration_us = complete_us > now_us
+                                    ? static_cast<uint32_t>(std::min<uint64_t>(
+                                          complete_us - now_us, UINT32_MAX))
+                                    : 0U;
     audio_stall_trace_l2cap_send(conn_handle, cid, sequence, write_index,
                                  curr_read_index,
                                  (audio_state & AudioState::AudioBusy) != 0U,
-                                 ASHA_SDU_SIZE_BYTES, result);
+                                 ASHA_SDU_SIZE_BYTES, call_duration_us, result);
     if (result == ERROR_CODE_SUCCESS) {
+        trace_last_successful_send_us = complete_us;
         trace_last_sequence = sequence;
     }
 #endif
@@ -1662,15 +1755,42 @@ bool HearingAid::process_audio_tx_watchdog(uint32_t write_index, bool audio_acti
                     return true;
                 }
                 uint32_t latest_index = write_index - 1U;
-#ifdef PICO_ASHA_AUDIO_STALL_TRACE
-                uint32_t dropped_frames = latest_index - audio_tx_ring_index;
-                uint8_t old_sequence = audio_tx_sequence;
-#endif
                 enum AshaAudioSide audio_side = rop.side() == Side::Left
                                                     ? AshaAudioSide::AudioLeft
                                                     : AshaAudioSide::AudioRight;
                 uint8_t* latest = asha_audio_get_encoded_at_index(audio_side,
                                                                   latest_index);
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+                uint32_t dropped_frames = latest_index - audio_tx_ring_index;
+                uint8_t old_sequence = audio_tx_sequence;
+                uint8_t new_sequence = latest[0];
+                uint32_t busy_duration_us =
+                    busy && now_us > trace_audio_busy_since_us
+                        ? static_cast<uint32_t>(std::min<uint64_t>(
+                              now_us - trace_audio_busy_since_us, UINT32_MAX))
+                        : 0U;
+                uint32_t last_request_age_us =
+                    trace_can_send_request_us == 0U || now_us < trace_can_send_request_us
+                        ? UINT32_MAX
+                        : static_cast<uint32_t>(std::min<uint64_t>(
+                              now_us - trace_can_send_request_us, UINT32_MAX));
+                uint32_t last_successful_send_age_us =
+                    trace_last_successful_send_us == 0U ||
+                            now_us < trace_last_successful_send_us
+                        ? UINT32_MAX
+                        : static_cast<uint32_t>(std::min<uint64_t>(
+                              now_us - trace_last_successful_send_us,
+                              UINT32_MAX));
+                uint16_t available_credits = l2cap_cbm_available_credits(cid);
+                audio_stall_trace_stale_frames_dropped(
+                    conn_handle, cid, old_sequence, new_sequence,
+                    write_index, curr_read_index, busy, busy_duration_us,
+                    dropped_frames,
+                    audio_tx_state == AudioTxState::WaitingCanSendNow,
+                    last_request_age_us, last_successful_send_age_us,
+                    asha_audio_get_pcm_streaming_enabled(),
+                    static_cast<uint8_t>(num_connected()), available_credits);
+#endif
                 memcpy(audio_tx_buffer.data(), latest, audio_tx_buffer.size());
                 audio_data = audio_tx_buffer.data();
                 audio_tx_ring_index = latest_index;
@@ -1679,10 +1799,6 @@ bool HearingAid::process_audio_tx_watchdog(uint32_t write_index, bool audio_acti
                 curr_read_index = write_index;
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
                 trace_pending_sequence = audio_tx_sequence;
-                audio_stall_trace_tx_stale_drop(
-                    conn_handle, cid, old_sequence, audio_tx_sequence,
-                    write_index, curr_read_index, busy, audio_age_us,
-                    dropped_frames);
 #endif
             }
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
@@ -1822,6 +1938,23 @@ void HearingAid::send_volume(int8_t volume)
 void HearingAid::disconnect()
 {
     //LOG_INFO("%s: Disconnect requested", get_side_str());
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    if (audio_tx_state != AudioTxState::Idle) {
+        uint64_t now_us = audio_stall_trace_now_us();
+        uint32_t state_duration_us =
+            now_us > audio_tx_state_since_us
+                ? static_cast<uint32_t>(std::min<uint64_t>(
+                      now_us - audio_tx_state_since_us, UINT32_MAX))
+                : 0U;
+        audio_stall_trace_send_state_changed(
+            conn_handle, cid, audio_tx_sequence,
+            asha_audio_get_write_index(), curr_read_index,
+            (audio_state & AudioState::AudioBusy) != 0U,
+            static_cast<uint8_t>(audio_tx_state),
+            static_cast<uint8_t>(AudioTxState::Idle),
+            AUDIO_STALL_TRACE_STATE_DISCONNECT, state_duration_us);
+    }
+#endif
     audio_tx_state = AudioTxState::Idle;
     audio_tx_state_since_us = 0U;
     audio_tx_sdu_since_us = 0U;
@@ -1858,6 +1991,7 @@ void HearingAid::reset()
     audio_tx_local_recovery = false;
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
     trace_can_send_request_us = 0U;
+    trace_can_send_now_us = 0U;
     trace_l2cap_send_us = 0U;
     trace_audio_busy_since_us = 0U;
     trace_last_successful_send_us = 0U;

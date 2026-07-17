@@ -166,11 +166,66 @@ class AudioTraceIntegrationTest(unittest.TestCase):
         self.assertIn("audio_can_send_watchdog_us = 30'000", header)
         self.assertIn("latest_index = write_index - 1U", watchdog)
         self.assertIn("curr_read_index = write_index", watchdog)
-        self.assertIn("audio_stall_trace_tx_stale_drop", watchdog)
+        self.assertIn("audio_stall_trace_stale_frames_dropped", watchdog)
         self.assertNotIn("l2cap_request_can_send_now_event(cid)", watchdog)
+        self.assertLess(
+            watchdog.index("audio_stall_trace_stale_frames_dropped"),
+            watchdog.index("memcpy(audio_tx_buffer.data()"),
+        )
+        self.assertLess(
+            watchdog.index("audio_stall_trace_stale_frames_dropped"),
+            watchdog.index("curr_read_index = write_index"),
+        )
+        for context in (
+            "busy_duration_us", "last_request_age_us",
+            "last_successful_send_age_us",
+            "asha_audio_get_pcm_streaming_enabled()",
+            "num_connected()", "available_credits",
+        ):
+            self.assertIn(context, watchdog)
         self.assertLess(
             watchdog.index("memcpy(audio_tx_buffer.data()"),
             watchdog.index("send_pending_audio(true, write_index)"),
+        )
+
+    def test_lifecycle_boot_delay_and_race_safe_snapshot_events(self):
+        trace_header = (ROOT / "src" / "audio_stall_trace.h").read_text(
+            encoding="utf-8"
+        )
+        trace_source = (ROOT / "src" / "audio_stall_trace.c").read_text(
+            encoding="utf-8"
+        )
+        hearing = (ROOT / "src" / "hearing_aid.cpp").read_text(
+            encoding="utf-8"
+        )
+        bt = (ROOT / "src" / "asha_bt.cpp").read_text(encoding="utf-8")
+
+        for event in (
+            "AUDIO_STALL_TRACE_HCI_CONNECTION_OPENED",
+            "AUDIO_STALL_TRACE_HCI_DISCONNECTION_COMPLETE",
+            "AUDIO_STALL_TRACE_L2CAP_CHANNEL_OPENED",
+            "AUDIO_STALL_TRACE_L2CAP_CHANNEL_CLOSED",
+            "AUDIO_STALL_TRACE_ASHA_DEVICE_CONNECTED",
+            "AUDIO_STALL_TRACE_ASHA_DEVICE_DISCONNECTED",
+            "AUDIO_STALL_TRACE_SYSTEM_BOOT",
+            "AUDIO_STALL_TRACE_WATCHDOG_RESET_REQUESTED",
+            "AUDIO_STALL_TRACE_SEND_DELAY_WARNING",
+            "AUDIO_STALL_TRACE_SEND_STATE_CHANGED",
+        ):
+            self.assertIn(event, trace_header)
+
+        self.assertIn("AUDIO_STALL_TRACE_HCI_CONNECTION_OPENED", bt)
+        self.assertIn("AUDIO_STALL_TRACE_HCI_DISCONNECTION_COMPLETE", hearing)
+        self.assertIn("AUDIO_STALL_TRACE_L2CAP_CHANNEL_OPENED", hearing)
+        self.assertIn("AUDIO_STALL_TRACE_L2CAP_CHANNEL_CLOSED", hearing)
+        self.assertEqual(3, bt.count("audio_stall_trace_watchdog_reset_requested"))
+
+        snapshot = function_body(trace_source, "void audio_stall_trace_snapshot")
+        self.assertIn("duration_us = now_us_low - since_us", snapshot)
+        self.assertIn("if (duration_us > INT32_MAX) continue", snapshot)
+        self.assertLess(
+            snapshot.index("if (duration_us > INT32_MAX) continue"),
+            snapshot.index("atomic_update_max"),
         )
 
     def test_low_overhead_platform_instrumentation_and_timer_threshold(self):

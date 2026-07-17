@@ -6,6 +6,7 @@
 #include <hardware/watchdog.h>
 
 #include "asha_bt.hpp"
+#include "asha_audio.h"
 #include "asha_comms.hpp"
 #include "audio_stall_trace.h"
 #include "asha_uuid.hpp"
@@ -160,6 +161,10 @@ static void process_serial_cmds()
             case Command::HCIDump:
                 if (runtime_settings.get_hci_dump_enabled() != cmd_pkt.data.enable_hci) {
                     RuntimeSettings::defer_hci_dump(cmd_pkt.data.enable_hci);
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+                    audio_stall_trace_watchdog_reset_requested(
+                        AUDIO_STALL_TRACE_WATCHDOG_HCI_DUMP_SETTING, 10U);
+#endif
                     watchdog_enable(10, true);
                 }
                 break;
@@ -171,6 +176,10 @@ static void process_serial_cmds()
                 }
                 break;
             case Command::Restart:
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+                audio_stall_trace_watchdog_reset_requested(
+                    AUDIO_STALL_TRACE_WATCHDOG_RESTART_COMMAND, 10U);
+#endif
                 watchdog_enable(10, true);
                 break;
             case Command::AllowConnect:
@@ -191,6 +200,10 @@ static void process_serial_cmds()
                     USBSettings settings = {.uac_version = info.uac_vers, .min_vol = info.min_vol, .max_vol = info.max_vol};
                     if (settings && settings != runtime_settings.get_usb_settings()) {
                         RuntimeSettings::defer_usb_settings(settings);
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+                        audio_stall_trace_watchdog_reset_requested(
+                            AUDIO_STALL_TRACE_WATCHDOG_USB_SETTING, 10U);
+#endif
                         watchdog_enable(10, true);
                     }
                 }
@@ -321,6 +334,15 @@ static void hci_event_handler(PACKET_HANDLER_PARAMS)
                 hci_con_handle_t handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
                 bd_addr_t addr = {};
                 gap_subevent_le_connection_complete_get_peer_address(packet, addr);
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+                uint32_t write_index = asha_audio_get_write_index();
+                audio_stall_trace_bluetooth_lifecycle(
+                    AUDIO_STALL_TRACE_HCI_CONNECTION_OPENED, handle, 0U, addr,
+                    gap_subevent_le_connection_complete_get_status(packet),
+                    AUDIO_STALL_TRACE_STATUS_UNAVAILABLE,
+                    AUDIO_STALL_TRACE_STATUS_UNAVAILABLE, write_index,
+                    write_index, false);
+#endif
                 HearingAid::on_connected(
                     addr, handle,
                     gap_subevent_le_connection_complete_get_conn_interval(packet),

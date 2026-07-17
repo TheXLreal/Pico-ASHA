@@ -36,9 +36,11 @@ def cobs_encode(data: bytes) -> bytes:
     return bytes(output)
 
 
-def record(timestamp, event, sequence=7, duration=0, result=0, handle=0x0040, cid=0x0041):
+def record(timestamp, event, sequence=7, duration=0, result=0,
+           handle=0x0040, cid=0x0041, write_index=10, read_index=9,
+           detail0=0, detail1=0):
     return trace.TRACE_RECORD.pack(
-        timestamp, 10, 9, duration, 0, 0, result,
+        timestamp, write_index, read_index, duration, detail0, detail1, result,
         handle, cid, event, sequence, 1, int(event not in (1, 7, 10, 11)),
     )
 
@@ -87,6 +89,49 @@ class ParseAudioStallTraceTest(unittest.TestCase):
         self.assertEqual([], records)
         self.assertEqual(1, len(snapshots))
         self.assertEqual(21, snapshots[0].counters["trace_dropped"])
+
+    def test_timeline_associates_sequence_255_across_wrap(self):
+        trace_records = [
+            record(100_000, 1, sequence=254, handle=trace.INVALID_HANDLE,
+                   cid=0, write_index=100, read_index=99),
+            record(101_000, 2, sequence=254, write_index=100,
+                   read_index=100),
+            record(102_000, 3, sequence=254, write_index=100,
+                   read_index=100),
+            record(103_000, 4, sequence=254, write_index=100,
+                   read_index=100),
+            record(120_000, 1, sequence=255, handle=trace.INVALID_HANDLE,
+                   cid=0, write_index=101, read_index=100),
+            record(121_000, 2, sequence=255, write_index=101,
+                   read_index=101),
+            record(122_000, 3, sequence=255, write_index=101,
+                   read_index=101),
+            record(123_000, 4, sequence=255, write_index=101,
+                   read_index=101),
+            record(140_000, 1, sequence=0, handle=trace.INVALID_HANDLE,
+                   cid=0, write_index=102, read_index=101),
+            record(141_000, 2, sequence=0, write_index=102,
+                   read_index=102),
+            record(142_000, 3, sequence=0, write_index=102,
+                   read_index=102),
+            record(143_000, 4, sequence=0, write_index=102,
+                   read_index=102),
+        ]
+        capture = b"".join(packet(trace_records[index:index + 5])
+                            for index in range(0, len(trace_records), 5))
+
+        records, _ = trace.parse_capture(capture)
+        timeline = trace.build_timeline(records)
+
+        self.assertEqual([254, 255, 0], [row.sequence for row in timeline])
+        self.assertEqual([254, 255, 256],
+                         [row.sequence_unwrapped for row in timeline])
+        event_rows = list(trace.records_as_rows(records))
+        sequence_255_rows = [row for row in event_rows
+                             if row["timestamp_us"] in (120_000, 121_000,
+                                                         122_000, 123_000)]
+        self.assertTrue(all(row["sequence"] == 255
+                            for row in sequence_255_rows))
 
     def test_tx_watchdog_events_keep_record_format_and_mark_reconnect(self):
         capture = packet([

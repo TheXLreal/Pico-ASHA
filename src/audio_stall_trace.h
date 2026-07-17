@@ -14,6 +14,8 @@ extern "C" {
 #define AUDIO_STALL_TRACE_INVALID_HANDLE 0xffffu
 #define AUDIO_STALL_TRACE_SNAPSHOT_INTERVAL_US 250000u
 #define AUDIO_STALL_TRACE_ANOMALY_US 25000u
+#define AUDIO_STALL_TRACE_SEND_DELAY_WARNING_US 50000u
+#define AUDIO_STALL_TRACE_STATUS_UNAVAILABLE 0xffu
 /* The Pico BTstack adapter adds one millisecond to the requested 1-ms timer;
  * observed healthy cadence is about 2.16 ms. Only gaps above 5 ms are late. */
 #define AUDIO_STALL_TRACE_AUDIO_TIMER_LATE_US 5000u
@@ -47,6 +49,44 @@ enum AudioStallTraceEvent {
     AUDIO_STALL_TRACE_CYW43_LOCK_ACQUIRED,
     AUDIO_STALL_TRACE_CYW43_LOCK_HELD,
     AUDIO_STALL_TRACE_RSSI_CONTEXT,
+    AUDIO_STALL_TRACE_L2CAP_SEND_BEGIN,
+    AUDIO_STALL_TRACE_SEND_STATE_CHANGED,
+    AUDIO_STALL_TRACE_SEND_DELAY_WARNING,
+    AUDIO_STALL_TRACE_STALE_FRAMES_DROPPED,
+    AUDIO_STALL_TRACE_STALE_DROP_CONTEXT,
+    AUDIO_STALL_TRACE_SEQUENCE_SKIP_COUNT_CHANGED,
+    AUDIO_STALL_TRACE_HCI_CONNECTION_OPENED,
+    AUDIO_STALL_TRACE_HCI_DISCONNECTION_COMPLETE,
+    AUDIO_STALL_TRACE_L2CAP_CHANNEL_OPENED,
+    AUDIO_STALL_TRACE_L2CAP_CHANNEL_CLOSED,
+    AUDIO_STALL_TRACE_ASHA_DEVICE_CONNECTED,
+    AUDIO_STALL_TRACE_ASHA_DEVICE_DISCONNECTED,
+    AUDIO_STALL_TRACE_SYSTEM_BOOT,
+    AUDIO_STALL_TRACE_WATCHDOG_RESET_REQUESTED,
+};
+
+/* Descriptive aliases for the original version-1 event IDs. */
+#define AUDIO_STALL_TRACE_SEND_REQUESTED AUDIO_STALL_TRACE_CAN_SEND_REQUESTED
+#define AUDIO_STALL_TRACE_CAN_SEND_NOW_RECEIVED AUDIO_STALL_TRACE_CAN_SEND_NOW
+#define AUDIO_STALL_TRACE_L2CAP_SEND_COMPLETE AUDIO_STALL_TRACE_L2CAP_SEND
+
+enum AudioStallTraceSendDelay {
+    AUDIO_STALL_TRACE_DELAY_SDU_TO_REQUEST = 1,
+    AUDIO_STALL_TRACE_DELAY_REQUEST_TO_CAN_SEND_NOW,
+    AUDIO_STALL_TRACE_DELAY_CAN_SEND_NOW_TO_L2CAP_SEND,
+    AUDIO_STALL_TRACE_DELAY_PREVIOUS_SEND_TO_REQUEST,
+};
+
+enum AudioStallTraceSendStateReason {
+    AUDIO_STALL_TRACE_STATE_LOCAL_RECOVERY = 1,
+    AUDIO_STALL_TRACE_STATE_DISCONNECT,
+    AUDIO_STALL_TRACE_STATE_RESET,
+};
+
+enum AudioStallTraceWatchdogReason {
+    AUDIO_STALL_TRACE_WATCHDOG_HCI_DUMP_SETTING = 1,
+    AUDIO_STALL_TRACE_WATCHDOG_RESTART_COMMAND,
+    AUDIO_STALL_TRACE_WATCHDOG_USB_SETTING,
 };
 
 enum AudioStallTracePayloadKind {
@@ -180,13 +220,20 @@ uint32_t audio_stall_trace_sdu_age_us(uint64_t now_us);
 
 void audio_stall_trace_sdu_generated(uint8_t sequence, uint32_t write_index);
 void audio_stall_trace_can_send_requested(uint16_t handle, uint16_t cid, uint8_t sequence,
-                                          uint32_t write_index, uint32_t read_index, bool busy);
+                                          uint32_t write_index, uint32_t read_index, bool busy,
+                                          uint32_t selected_ring_index,
+                                          uint32_t previous_send_age_us);
 void audio_stall_trace_can_send_now(uint16_t handle, uint16_t cid, uint8_t sequence,
                                     uint32_t write_index, uint32_t read_index, bool busy,
                                     uint32_t wait_us);
+void audio_stall_trace_l2cap_send_begin(uint16_t handle, uint16_t cid, uint8_t sequence,
+                                        uint32_t write_index, uint32_t read_index, bool busy,
+                                        uint32_t can_send_now_to_send_us,
+                                        bool local_recovery);
 void audio_stall_trace_l2cap_send(uint16_t handle, uint16_t cid, uint8_t sequence,
                                   uint32_t write_index, uint32_t read_index, bool busy,
-                                  uint16_t sdu_size, int32_t result);
+                                  uint16_t sdu_size, uint32_t call_duration_us,
+                                  int32_t result);
 void audio_stall_trace_packet_sent(uint16_t handle, uint16_t cid, uint8_t sequence,
                                    uint32_t write_index, uint32_t read_index, bool busy,
                                    uint32_t wait_us);
@@ -218,6 +265,25 @@ void audio_stall_trace_tx_stale_drop(uint16_t handle, uint16_t cid,
                                      uint32_t write_index, uint32_t read_index,
                                      bool busy, uint32_t age_us,
                                      uint32_t dropped_frames);
+void audio_stall_trace_stale_frames_dropped(
+    uint16_t handle, uint16_t cid, uint8_t old_sequence, uint8_t new_sequence,
+    uint32_t write_index, uint32_t read_index, bool busy,
+    uint32_t busy_duration_us, uint32_t dropped_frames,
+    bool can_send_now_pending, uint32_t last_request_age_us,
+    uint32_t last_successful_send_age_us, bool pcm_streaming,
+    uint8_t connected_devices, uint16_t available_credits);
+void audio_stall_trace_send_state_changed(
+    uint16_t handle, uint16_t cid, uint8_t sequence,
+    uint32_t write_index, uint32_t read_index, bool busy,
+    uint8_t old_state, uint8_t new_state, uint8_t reason,
+    uint32_t old_state_duration_us);
+void audio_stall_trace_bluetooth_lifecycle(
+    uint8_t event_type, uint16_t handle, uint16_t cid,
+    const uint8_t address[6], uint8_t hci_status, uint8_t hci_reason,
+    uint8_t l2cap_status, uint32_t write_index, uint32_t read_index,
+    bool busy);
+void audio_stall_trace_watchdog_reset_requested(uint8_t reason,
+                                                uint32_t delay_ms);
 void audio_stall_trace_hci_write(uint64_t begin_us, uint64_t end_us,
                                  uint8_t packet_type, int32_t result);
 void audio_stall_trace_cyw43_lock_acquired(uint64_t begin_us, uint64_t acquired_us);

@@ -5,8 +5,4 @@ logs
 src/old
 CMakeLists.txt.user
 site/
-audio_stall_trace*.bin
-audio_stall_trace*.csv
-__pycache__/
-*.py[cod]
 logs/
