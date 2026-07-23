@@ -6,18 +6,17 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
     PICO_SDK_COMMIT_HASH: a1438dff1d38bd9c65dbd693f0e5db4b9ae91779
     TINYUSB_TAG: "0.20.0"
+    ARM_GNU_TOOLCHAIN_VERSION: "14.2.rel1"
+    ARM_GNU_TOOLCHAIN_BASENAME: arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-eabi
 
 jobs:
     build_firmware:
-        strategy:
-          matrix:
-            board: ["pico_w", "pico2_w"]
-        name: Build Pico-ASHA for ${{ matrix.board }}
+        name: Build Pico-ASHA firmware
         runs-on: ubuntu-24.04
         steps:
             - name: Checkout repository
@@ -34,30 +33,68 @@ jobs:
                 ref: "${{ env.PICO_SDK_COMMIT_HASH }}"
                 fetch-depth: "0"
 
-            - name: Install dependencies
-              run: |
-                sudo apt-get update && sudo apt-get -y install cmake gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
-            
-            - name: Configure build
-              run: |
-                mkdir -p pico-asha/build/${{ matrix.board }}
-                cd pico-asha/build/${{ matrix.board }}
-                cmake \
-                  -DPICO_SDK_PATH=${{github.workspace}}/pico-sdk \
-                  -DCMAKE_BUILD_TYPE=MinSizeRel \
-                  -DPICO_BOARD=${{ matrix.board }} \
-                  ../..
+            - name: Cache Arm GNU toolchain
+              id: arm-toolchain-cache
+              uses: actions/cache@v4
+              with:
+                path: ${{ runner.tool_cache }}/${{ env.ARM_GNU_TOOLCHAIN_BASENAME }}
+                key: ${{ runner.os }}-${{ runner.arch }}-${{ env.ARM_GNU_TOOLCHAIN_BASENAME }}
 
-            - name: Compile
+            - name: Install Arm GNU toolchain
+              if: steps.arm-toolchain-cache.outputs.cache-hit != 'true'
               run: |
-                cd pico-asha/build/${{ matrix.board }}
-                cmake --build .
+                set -euo pipefail
+                archive="${ARM_GNU_TOOLCHAIN_BASENAME}.tar.xz"
+                base_url="https://developer.arm.com/-/media/Files/downloads/gnu/${ARM_GNU_TOOLCHAIN_VERSION}/binrel"
 
-            - name: Upload UF2 and ELF binaries
+                curl --fail --location --retry 3 \
+                  --output "${RUNNER_TEMP}/${archive}" \
+                  "${base_url}/${archive}"
+                curl --fail --location --retry 3 \
+                  --output "${RUNNER_TEMP}/${archive}.sha256asc" \
+                  "${base_url}/${archive}.sha256asc"
+
+                cd "${RUNNER_TEMP}"
+                sha256sum --check "${archive}.sha256asc"
+                mkdir -p "${RUNNER_TOOL_CACHE}/${ARM_GNU_TOOLCHAIN_BASENAME}"
+                tar -xJf "${archive}" \
+                  --strip-components=1 \
+                  -C "${RUNNER_TOOL_CACHE}/${ARM_GNU_TOOLCHAIN_BASENAME}"
+
+            - name: Add Arm GNU toolchain to PATH
+              run: |
+                echo "${RUNNER_TOOL_CACHE}/${ARM_GNU_TOOLCHAIN_BASENAME}/bin" >> "${GITHUB_PATH}"
+
+            - name: Configure and compile firmware
+              run: |
+                set -euo pipefail
+                arm-none-eabi-gcc --version
+
+                for board in pico_w pico2_w; do
+                  cmake \
+                    -S pico-asha \
+                    -B "pico-asha/build/${board}" \
+                    -DPICO_SDK_PATH="${{ github.workspace }}/pico-sdk" \
+                    -DCMAKE_BUILD_TYPE=MinSizeRel \
+                    -DPICO_BOARD="${board}"
+                  cmake --build "pico-asha/build/${board}"
+                done
+
+            - name: Upload pico_w UF2 and ELF binaries
               uses: actions/upload-artifact@v4
               with:
-                name: pico-asha-firmware-${{ matrix.board }}
-                path: pico-asha/build/${{ matrix.board }}/pico_asha.[ue][fl][2f]
+                name: pico-asha-firmware-pico_w
+                path: |
+                  pico-asha/build/pico_w/pico_asha.uf2
+                  pico-asha/build/pico_w/pico_asha.elf
+
+            - name: Upload pico2_w UF2 and ELF binaries
+              uses: actions/upload-artifact@v4
+              with:
+                name: pico-asha-firmware-pico2_w
+                path: |
+                  pico-asha/build/pico2_w/pico_asha.uf2
+                  pico-asha/build/pico2_w/pico_asha.elf
 
     build_gui_windows:
         name: Build GUI for Windows
