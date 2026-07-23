@@ -2354,12 +2354,12 @@ bool HearingAid::process_audio_no_progress(uint32_t write_index,
         return false;
     }
 
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
     enum AshaAudioSide audio_side = rop.side() == Side::Left
                                         ? AshaAudioSide::AudioLeft
                                         : AshaAudioSide::AudioRight;
     uint8_t newest_sequence = asha_audio_get_encoded_at_index(
                                   audio_side, write_index - 1U)[0];
-#ifdef PICO_ASHA_AUDIO_STALL_TRACE
     audio_stall_trace_audio_no_progress(
         AUDIO_STALL_TRACE_AUDIO_NO_PROGRESS, conn_handle, cid,
         newest_sequence, write_index, curr_read_index,
