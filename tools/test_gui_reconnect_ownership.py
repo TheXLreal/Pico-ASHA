@@ -38,7 +38,10 @@ class GuiReconnectOwnershipTest(unittest.TestCase):
         firmware = (ROOT / "src" / "hearing_aid.cpp").read_text(encoding="utf-8")
         on_disconnect = function_body(firmware, "void HearingAid::on_disconnected")
         self.assertIn("BLEConnectionState::Recovering", on_disconnect)
-        self.assertIn("start_scan();", on_disconnect)
+        self.assertIn("schedule_reconnect(ha, status, reason)", on_disconnect)
+        self.assertNotIn("start_scan();", on_disconnect)
+        reconnect_loop = function_body(firmware, "void HearingAid::process_reconnect")
+        self.assertIn("start_scan();", reconnect_loop)
         self.assertIn("ha->reset();", on_disconnect)
 
     def test_gui_timers_only_manage_serial_discovery_and_intro_timeout(self):

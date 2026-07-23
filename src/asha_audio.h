@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -57,6 +59,17 @@ struct PCMStereoSample {
     int16_t right;
 };
 
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+struct AshaAudioTraceSnapshot {
+    uint32_t pcm_block_checksum;
+    uint32_t pcm_block_time_us;
+    uint32_t latest_sdu_write_index;
+    uint32_t sdu_checksum_l;
+    uint32_t sdu_checksum_r;
+    uint8_t sequence;
+};
+#endif
+
 void asha_audio_init();
 
 /**
@@ -68,6 +81,12 @@ void asha_audio_init();
 uint32_t asha_audio_get_write_index();
 
 /**
+ * Low 32 bits of the timestamp captured when the latest complete SDU was
+ * published. Subtract from a low 32-bit current timestamp for wrap-safe ages.
+ */
+uint32_t asha_audio_get_last_sdu_generated_time_us();
+
+/**
  * Encode 1ms of 16-bit 16kHz PCM stereo audio to G.722
  */
 void asha_audio_encode_1ms_pcm(struct PCMStereoSample* samples, uint16_t count);
@@ -76,6 +95,19 @@ void asha_audio_encode_1ms_pcm(struct PCMStereoSample* samples, uint16_t count);
  * Get encoded audio for side at index
  */
 uint8_t* asha_audio_get_encoded_at_index(enum AshaAudioSide side, uint32_t index);
+
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+/** Diagnostic-only FNV-1a checksum. It never gates or changes audio. */
+uint32_t asha_audio_trace_checksum(const uint8_t* data, size_t size);
+
+/** Read the generation and checksum published with an encoded ring slot. */
+void asha_audio_get_encoded_trace(enum AshaAudioSide side, uint32_t index,
+                                  uint32_t* published_write_index,
+                                  uint32_t* checksum);
+
+/** Snapshot the latest PCM and completed-SDU content fingerprints. */
+void asha_audio_get_trace_snapshot(struct AshaAudioTraceSnapshot* snapshot);
+#endif
 
 #ifdef PICO_ASHA_ENC_STATS
 int16_t* asha_audio_get_encoding_time_at_index(uint32_t index);

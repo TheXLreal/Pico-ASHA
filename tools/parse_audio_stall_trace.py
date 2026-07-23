@@ -17,6 +17,8 @@ from typing import Iterable, Iterator, Sequence
 TRACE_MAGIC = 0x52545341  # b"ASTR" decoded as little endian
 TRACE_VERSION = 1
 ASHA_TYPE_AUDIO_TRACE = 7
+PICO_TYPE_COMMAND = 4
+COMMAND_AUDIO_GLITCH_MARKER = 8
 INVALID_HANDLE = 0xFFFF
 INVALID_SEQUENCE = 0xFF
 ANOMALY_US = 25_000
@@ -26,8 +28,12 @@ RING_CAPACITY = 8
 PICO_HEADER = struct.Struct("<BBHI")
 TRACE_HEADER = struct.Struct("<IBBBB")
 TRACE_RECORD = struct.Struct("<QIIIIIiHHBBBB")
+COMMAND_PACKET = struct.Struct("<BB10x")
 SNAPSHOT = struct.Struct("<Q" + "I" * 21)
 RUNTIME_SNAPSHOT = struct.Struct("<Q" + "I" * 14 + "i" * 2 + "I" * 4)
+RUNTIME_SNAPSHOT_EXTENDED = struct.Struct(
+    "<Q" + "I" * 14 + "i" * 2 + "I" * 12
+)
 
 PAYLOAD_RECORDS = 1
 PAYLOAD_SNAPSHOT = 2
@@ -73,6 +79,24 @@ EVENT_NAMES = {
     37: "ASHA_DEVICE_DISCONNECTED",
     38: "SYSTEM_BOOT",
     39: "WATCHDOG_RESET_REQUESTED",
+    40: "AUDIO_NO_PROGRESS",
+    41: "AUDIO_NO_PROGRESS_REARMED",
+    42: "AUDIO_NO_PROGRESS_RECONNECT",
+    43: "RECONNECT_SCHEDULED",
+    44: "SCAN_START_REQUESTED",
+    45: "CONNECT_ATTEMPT",
+    46: "CONNECT_COMPLETE",
+    47: "RECONNECT_TIMEOUT",
+    48: "AUDIO_CREDITS_ZERO_ENTER",
+    49: "AUDIO_CREDITS_ZERO_EXIT",
+    50: "CORE1_RUN_LOOP_HEARTBEAT",
+    51: "PROCESS_AUDIO_ENTER",
+    52: "TX_BLOCKED",
+    53: "CAN_SEND_REQUEST_AGE",
+    54: "PACKET_SENT_WAIT_AGE",
+    55: "AUDIO_PCM_DISCONTINUITY",
+    56: "AUDIO_G722_INTEGRITY_ERROR",
+    57: "USER_AUDIO_GLITCH_MARKER",
 }
 
 DELAY_NAMES = {
@@ -94,15 +118,41 @@ TX_STATE_REASON_NAMES = {
     3: "reset",
 }
 
+TX_BLOCKER_NAMES = {
+    1 << 0: "not_connected",
+    1 << 1: "not_streaming",
+    1 << 2: "l2cap_not_ready",
+    1 << 3: "no_sdu_available",
+    1 << 4: "sdu_not_fresh",
+    1 << 5: "waiting_can_send_now",
+    1 << 6: "waiting_packet_sent",
+    1 << 7: "can_send_pending",
+    1 << 8: "audio_busy",
+    1 << 9: "no_credits",
+    1 << 10: "pcm_not_streaming",
+    1 << 11: "audio_disabled",
+    1 << 12: "process_not_audio",
+    1 << 13: "connections_disabled",
+    1 << 14: "tx_buffer_owned",
+    1 << 15: "invariant_not_armed",
+}
+
+G722_INTEGRITY_STAGE_NAMES = {
+    1: "ring_generation",
+    2: "ring_checksum",
+    3: "tx_buffer_changed",
+}
+
 WATCHDOG_REASON_NAMES = {
     1: "hci_dump_setting",
     2: "restart_command",
     3: "usb_setting",
+    4: "reconnect_fallback",
 }
 
 SEQUENCE_EVENT_TYPES = {
     1, 2, 3, 4, 5, 6, 7, 12, 16, 17, 18, 19,
-    26, 27, 28, 29, 30, 31,
+    26, 27, 28, 29, 30, 31, 40, 41, 42, 52, 53, 54, 55, 56, 57,
 }
 
 SNAPSHOT_FIELDS = (
@@ -150,6 +200,17 @@ RUNTIME_SNAPSHOT_FIELDS = (
     "rssi_slot1_age_us",
     "tx_stale_drop_count",
     "tx_stale_drop_frames",
+)
+
+RUNTIME_SNAPSHOT_EXTENDED_FIELDS = RUNTIME_SNAPSHOT_FIELDS + (
+    "core1_run_loop_count",
+    "core1_run_loop_age_us",
+    "process_audio_enter_count",
+    "process_audio_enter_age_us",
+    "hci_transport_progress_count",
+    "hci_transport_progress_age_us",
+    "hci_controller_progress_count",
+    "hci_controller_progress_age_us",
 )
 
 
@@ -209,6 +270,40 @@ class CaptureResult:
     data: bytes
     interrupted: bool = False
     error: str | None = None
+    marker_count: int = 0
+
+
+def cobs_encode(payload: bytes) -> bytes:
+    """Encode *payload* as one COBS frame with a trailing delimiter."""
+    output = bytearray(b"\0")
+    code_index = 0
+    code = 1
+    for value in payload:
+        if value == 0:
+            output[code_index] = code
+            code_index = len(output)
+            output.append(0)
+            code = 1
+        else:
+            output.append(value)
+            code += 1
+            if code == 0xFF:
+                output[code_index] = code
+                code_index = len(output)
+                output.append(0)
+                code = 1
+    output[code_index] = code
+    output.append(0)
+    return bytes(output)
+
+
+def build_audio_glitch_marker_command() -> bytes:
+    """Build the existing CDC command frame for a firmware trace marker."""
+    command = COMMAND_PACKET.pack(COMMAND_AUDIO_GLITCH_MARKER, 0)
+    header = PICO_HEADER.pack(
+        PICO_TYPE_COMMAND, PICO_HEADER.size + len(command), 0, 0
+    )
+    return b"\0" + cobs_encode(header + command)
 
 
 def cobs_decode(frame: bytes) -> bytes:
@@ -274,11 +369,19 @@ def parse_trace_payload(payload: bytes) -> tuple[list[TraceRecord], list[TraceSn
         values = SNAPSHOT.unpack(body)
         snapshots.append(TraceSnapshot(values[0], dict(zip(SNAPSHOT_FIELDS, values[1:]))))
     elif kind == PAYLOAD_RUNTIME_SNAPSHOT:
-        if count != 1 or len(body) != RUNTIME_SNAPSHOT.size:
+        if count != 1 or len(body) not in (
+            RUNTIME_SNAPSHOT.size, RUNTIME_SNAPSHOT_EXTENDED.size
+        ):
             return [], []
-        values = RUNTIME_SNAPSHOT.unpack(body)
+        snapshot_struct = (RUNTIME_SNAPSHOT_EXTENDED
+                           if len(body) == RUNTIME_SNAPSHOT_EXTENDED.size
+                           else RUNTIME_SNAPSHOT)
+        fields = (RUNTIME_SNAPSHOT_EXTENDED_FIELDS
+                  if snapshot_struct is RUNTIME_SNAPSHOT_EXTENDED
+                  else RUNTIME_SNAPSHOT_FIELDS)
+        values = snapshot_struct.unpack(body)
         snapshots.append(TraceSnapshot(
-            values[0], dict(zip(RUNTIME_SNAPSHOT_FIELDS, values[1:]))
+            values[0], dict(zip(fields, values[1:]))
         ))
     return records, snapshots
 
@@ -355,6 +458,24 @@ def anomaly_reasons(record: TraceRecord) -> list[str]:
         reasons.append("hci_disconnect")
     if record.event_type == 35:
         reasons.append("l2cap_channel_closed")
+    if record.event_type == 40:
+        reasons.append("audio_no_progress")
+    if record.event_type == 42:
+        reasons.append("audio_no_progress_reconnect")
+    if record.event_type == 47:
+        reasons.append("reconnect_timeout")
+    if record.event_type == 49 and record.duration_us > ANOMALY_US:
+        reasons.append("audio_credits_zero")
+    if record.event_type == 52:
+        reasons.append("tx_blocked")
+    if record.event_type == 53:
+        reasons.append("can_send_request_aged")
+    if record.event_type == 54:
+        reasons.append("packet_sent_wait_aged")
+    if record.event_type == 55:
+        reasons.append("pcm_boundary_discontinuity")
+    if record.event_type == 56:
+        reasons.append("g722_integrity_error")
     if record.event_type == 21:
         reasons.append("hci_write_slow")
     if record.event_type == 23:
@@ -475,6 +596,102 @@ def event_details(record: TraceRecord) -> str:
         reason = WATCHDOG_REASON_NAMES.get(record.detail0, str(record.detail0))
         return (f"reason={reason};delay_us={record.duration_us};"
                 f"boot_session_id={record.detail1}")
+    if record.event_type in (40, 41, 42):
+        return (f"last_successful_send_age_us={record.duration_us};"
+                f"newest_sdu_age_us={record.detail0};"
+                f"tx_state={TX_STATE_NAMES.get((record.detail1 >> 16) & 0xff, record.detail1 >> 16)};"
+                f"available_audio_credits={record.detail1 & 0xffff};"
+                f"status=0x{record.result & 0xffffffff:08x}")
+    if record.event_type in (43, 44, 45, 46, 47):
+        hci_status = (record.detail1 >> 16) & 0xff
+        hci_reason = (record.detail1 >> 24) & 0xff
+        return (f"attempt={record.duration_us};"
+                f"hci_status=0x{hci_status:02x};"
+                f"hci_reason=0x{hci_reason:02x};"
+                f"status=0x{record.result & 0xffffffff:08x}")
+    if record.event_type in (48, 49):
+        rssi_valid = bool(record.result & 0x100)
+        rssi = record.result & 0xff
+        if rssi >= 128:
+            rssi -= 256
+        rssi_age = ("unknown" if record.detail1 == 0xffffffff
+                    else record.detail1)
+        return (f"zero_credit_duration_us={record.duration_us};"
+                f"available_audio_credits={record.detail0 & 0xffff};"
+                f"rssi_dbm={rssi if rssi_valid else 'unknown'};"
+                f"rssi_age_us={rssi_age}")
+    if record.event_type == 50:
+        transport_age = ("unknown" if record.duration_us == 0xffffffff
+                         else record.duration_us)
+        controller_age = ("unknown" if record.detail1 == 0xffffffff
+                          else record.detail1)
+        return (f"core1_run_loop_count={record.detail0};"
+                f"process_audio_enter_count={record.result & 0xffffffff};"
+                f"hci_transport_progress_age_us={transport_age};"
+                f"hci_controller_progress_age_us={controller_age}")
+    if record.event_type == 51:
+        run_loop_age = ("unknown" if record.duration_us == 0xffffffff
+                        else record.duration_us)
+        transport_age = ("unknown" if record.detail1 == 0xffffffff
+                         else record.detail1)
+        controller_value = record.result & 0xffffffff
+        controller_age = ("unknown" if controller_value == 0xffffffff
+                          else controller_value)
+        return (f"process_audio_enter_count={record.detail0};"
+                f"core1_run_loop_age_us={run_loop_age};"
+                f"hci_transport_progress_age_us={transport_age};"
+                f"hci_controller_progress_age_us={controller_age}")
+    if record.event_type == 52:
+        blocker_names = [name for bit, name in TX_BLOCKER_NAMES.items()
+                         if record.detail0 & bit]
+        tx_state = (record.result >> 16) & 0xff
+        return (f"last_successful_send_age_us={record.duration_us};"
+                f"blocker_mask=0x{record.detail0:08x};"
+                f"blockers={'|'.join(blocker_names) or 'none'};"
+                f"newest_sdu_age_us={record.detail1};"
+                f"tx_state={TX_STATE_NAMES.get(tx_state, tx_state)};"
+                f"available_audio_credits={record.result & 0xffff};"
+                f"can_send_now_request_pending={bool(record.result & (1 << 24))}")
+    if record.event_type in (53, 54):
+        transport_age = ("unknown" if record.detail0 == 0xffffffff
+                         else record.detail0)
+        controller_age = ("unknown" if record.detail1 == 0xffffffff
+                          else record.detail1)
+        tx_state = (record.result >> 16) & 0xff
+        return (f"wait_age_us={record.duration_us};"
+                f"tx_state={TX_STATE_NAMES.get(tx_state, tx_state)};"
+                f"available_audio_credits={record.result & 0xffff};"
+                f"hci_transport_progress_age_us={transport_age};"
+                f"hci_controller_progress_age_us={controller_age}")
+    if record.event_type == 55:
+        channel_flags = (record.result >> 16) & 0xff
+        channels = []
+        if channel_flags & 1:
+            channels.append("left")
+        if channel_flags & 2:
+            channels.append("right")
+        return (f"pcm_gap_us={record.duration_us};"
+                f"left_boundary_jump={record.detail0};"
+                f"right_boundary_jump={record.detail1};"
+                f"sample_count={record.result & 0xffff};"
+                f"channels={'|'.join(channels) or 'none'}")
+    if record.event_type == 56:
+        stage = G722_INTEGRITY_STAGE_NAMES.get(
+            record.duration_us, f"unknown_{record.duration_us}"
+        )
+        return (f"stage={stage};"
+                f"expected=0x{record.detail0:08x};"
+                f"actual=0x{record.detail1:08x};"
+                f"observed_generation={record.result & 0xffffffff};"
+                f"selected_ring_index={record.read_index}")
+    if record.event_type == 57:
+        pcm_age = ("unknown" if record.duration_us == 0xffffffff
+                   else record.duration_us)
+        return (f"latest_pcm_age_us={pcm_age};"
+                f"latest_pcm_checksum=0x{record.detail0:08x};"
+                f"latest_sdu_left_checksum=0x{record.detail1:08x};"
+                f"latest_sdu_right_checksum=0x{record.result & 0xffffffff:08x};"
+                f"latest_sdu_write_index={record.write_index}")
     return ""
 
 
@@ -724,6 +941,28 @@ def write_csv(path: Path, rows: Iterable[dict[str, object]]) -> int:
     return len(materialized)
 
 
+def console_glitch_marker_pressed() -> bool:
+    """Poll the console without delaying serial capture."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        marked = False
+        while msvcrt.kbhit():
+            key = msvcrt.getwch()
+            if key == "\x03":
+                raise KeyboardInterrupt
+            if key.lower() == "m":
+                marked = True
+        return marked
+
+    import select
+
+    if not sys.stdin.isatty():
+        return False
+    ready, _, _ = select.select([sys.stdin], [], [], 0)
+    return bool(ready and sys.stdin.read(1).lower() == "m")
+
+
 def capture_serial(
     port: str,
     seconds: float,
@@ -733,6 +972,9 @@ def capture_serial(
     serial_factory=None,
     serial_errors: tuple[type[BaseException], ...] | None = None,
     flush_interval: float = 1.0,
+    mark_glitches: bool = False,
+    marker_poll=None,
+    marker_notify=None,
 ) -> CaptureResult:
     """Capture CDC bytes while continuously preserving them in *raw_output*.
 
@@ -755,6 +997,9 @@ def capture_serial(
     next_flush = time.monotonic() + max(0.0, flush_interval)
     interrupted = False
     capture_error: str | None = None
+    marker_count = 0
+    if mark_glitches and marker_poll is None:
+        marker_poll = console_glitch_marker_pressed
 
     # Open the raw file first, so even failure while opening the COM port leaves
     # a well-defined capture artifact. Each received chunk is persisted before
@@ -763,6 +1008,11 @@ def capture_serial(
         try:
             with serial_factory(port, baudrate=baudrate, timeout=0.1) as connection:
                 while time.monotonic() < deadline:
+                    if mark_glitches and marker_poll is not None and marker_poll():
+                        connection.write(build_audio_glitch_marker_command())
+                        marker_count += 1
+                        if marker_notify is not None:
+                            marker_notify(marker_count)
                     chunk = connection.read(max(1, connection.in_waiting))
                     if chunk:
                         output.write(chunk)
@@ -781,6 +1031,7 @@ def capture_serial(
         data=raw_output.read_bytes(),
         interrupted=interrupted,
         error=capture_error,
+        marker_count=marker_count,
     )
 
 
@@ -805,18 +1056,28 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--capture-seconds", type=float, default=60.0)
     parser.add_argument("--baudrate", type=int, default=115200, help="CDC nominal baudrate")
     parser.add_argument("--raw-output", type=Path, default=Path("audio_stall_trace.bin"))
+    parser.add_argument(
+        "--mark-glitches", action="store_true",
+        help="press M during live capture to insert USER_AUDIO_GLITCH_MARKER",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     if args.capture_port:
+        if args.mark_glitches:
+            print("glitch marking enabled: press M whenever bad audio is heard")
         try:
             capture = capture_serial(
                 args.capture_port,
                 args.capture_seconds,
                 args.baudrate,
                 args.raw_output,
+                mark_glitches=args.mark_glitches,
+                marker_notify=lambda count: print(
+                    f"glitch marker {count} requested"
+                ),
             )
         except RuntimeError as error:
             print(f"error: {error}", file=sys.stderr)
@@ -829,6 +1090,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if capture.error:
             print(f"serial capture stopped: {capture.error}; parsing saved partial data",
                   file=sys.stderr)
+        if capture.marker_count:
+            print(f"requested {capture.marker_count} firmware glitch marker(s)")
     elif args.input:
         source = args.input
         data = source.read_bytes()

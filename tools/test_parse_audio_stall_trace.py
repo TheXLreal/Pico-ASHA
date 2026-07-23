@@ -150,6 +150,157 @@ class ParseAudioStallTraceTest(unittest.TestCase):
         self.assertEqual([], trace.anomaly_reasons(records[1]))
         self.assertIn("audio_tx_reconnect", trace.anomaly_reasons(records[2]))
 
+    def test_audio_no_progress_and_reconnect_transition_events(self):
+        capture = packet([
+            record(500_000, 40, duration=101_000, detail0=10_000,
+                   detail1=(0 << 16) | 7, write_index=20, read_index=14),
+            record(500_100, 41, duration=101_100, detail0=10_100,
+                   detail1=(1 << 16) | 7),
+            record(650_100, 42, duration=251_100, detail0=9_000,
+                   detail1=(2 << 16) | 6, result=0x08),
+            record(650_200, 43, duration=1, result=0x08),
+            record(12_650_200, 47, duration=3, result=0x08),
+        ])
+
+        records, _ = trace.parse_capture(capture)
+        self.assertEqual(
+            ["AUDIO_NO_PROGRESS", "AUDIO_NO_PROGRESS_REARMED",
+             "AUDIO_NO_PROGRESS_RECONNECT", "RECONNECT_SCHEDULED",
+             "RECONNECT_TIMEOUT"],
+            [item.event for item in records],
+        )
+        self.assertIn("audio_no_progress", trace.anomaly_reasons(records[0]))
+        self.assertIn("audio_no_progress_reconnect",
+                      trace.anomaly_reasons(records[2]))
+        self.assertIn("reconnect_timeout", trace.anomaly_reasons(records[4]))
+        self.assertIn("tx_state=Idle", trace.event_details(records[0]))
+        self.assertIn("attempt=3", trace.event_details(records[4]))
+
+    def test_zero_credit_transitions_decode_duration_credits_and_rssi(self):
+        capture = packet([
+            record(700_000, 48, sequence=111, duration=0, detail0=0,
+                   detail1=100_000, result=0x100 | ((-88) & 0xff)),
+            record(747_599, 49, sequence=111, duration=47_599, detail0=2,
+                   detail1=125_000, result=0x100 | ((-95) & 0xff)),
+        ])
+
+        records, _ = trace.parse_capture(capture)
+        self.assertEqual(
+            ["AUDIO_CREDITS_ZERO_ENTER", "AUDIO_CREDITS_ZERO_EXIT"],
+            [item.event for item in records],
+        )
+        self.assertIn("available_audio_credits=0",
+                      trace.event_details(records[0]))
+        details = trace.event_details(records[1])
+        self.assertIn("zero_credit_duration_us=47599", details)
+        self.assertIn("available_audio_credits=2", details)
+        self.assertIn("rssi_dbm=-95", details)
+        self.assertIn("rssi_age_us=125000", details)
+        self.assertEqual([], trace.anomaly_reasons(records[0]))
+        self.assertIn("audio_credits_zero",
+                      trace.anomaly_reasons(records[1]))
+
+    def test_tx_stall_phase_diagnostics_decode_blockers_and_progress_ages(self):
+        blocked_state = (31 | (0 << 16))
+        wait_state = (31 | (1 << 16))
+        packet_state = (30 | (2 << 16))
+        capture = packet([
+            record(1_000_000, 50, duration=2_000, detail0=450,
+                   detail1=3_000, result=449,
+                   handle=trace.INVALID_HANDLE, cid=0),
+            record(1_000_010, 51, duration=10, detail0=450,
+                   detail1=2_010, result=3_010,
+                   handle=trace.INVALID_HANDLE, cid=0),
+            record(1_050_000, 52, duration=50_000,
+                   detail0=(1 << 8) | (1 << 15), detail1=1_200,
+                   result=blocked_state),
+            record(1_075_000, 53, duration=25_000, detail0=500,
+                   detail1=700, result=wait_state),
+            record(1_125_000, 54, duration=50_000, detail0=50_000,
+                   detail1=51_000, result=packet_state),
+        ])
+
+        records, _ = trace.parse_capture(capture)
+        self.assertEqual(
+            ["CORE1_RUN_LOOP_HEARTBEAT", "PROCESS_AUDIO_ENTER",
+             "TX_BLOCKED", "CAN_SEND_REQUEST_AGE",
+             "PACKET_SENT_WAIT_AGE"],
+            [item.event for item in records],
+        )
+        blocked = trace.event_details(records[2])
+        self.assertIn("blocker_mask=0x00008100", blocked)
+        self.assertIn("audio_busy|invariant_not_armed", blocked)
+        self.assertIn("available_audio_credits=31", blocked)
+        self.assertIn("tx_blocked", trace.anomaly_reasons(records[2]))
+        self.assertIn("tx_state=WaitingCanSendNow",
+                      trace.event_details(records[3]))
+        self.assertIn("hci_transport_progress_age_us=500",
+                      trace.event_details(records[3]))
+        self.assertIn("packet_sent_wait_aged",
+                      trace.anomaly_reasons(records[4]))
+
+    def test_extended_runtime_snapshot_adds_progress_counters(self):
+        values = [900_000] + list(range(1, 29))
+        body = trace.RUNTIME_SNAPSHOT_EXTENDED.pack(*values)
+        payload = trace.TRACE_HEADER.pack(
+            trace.TRACE_MAGIC, trace.TRACE_VERSION,
+            trace.PAYLOAD_RUNTIME_SNAPSHOT, 1, len(body),
+        ) + body
+
+        records, snapshots = trace.parse_trace_payload(payload)
+        self.assertEqual([], records)
+        self.assertEqual(1, len(snapshots))
+        self.assertEqual(21, snapshots[0].counters["core1_run_loop_count"])
+        self.assertEqual(28,
+                         snapshots[0].counters["hci_controller_progress_age_us"])
+
+    def test_audio_content_diagnostics_and_manual_marker_decode(self):
+        capture = packet([
+            record(1_200_000, 55, sequence=255, duration=1_002,
+                   detail0=30_001, detail1=42,
+                   result=(1 << 16) | 48),
+            record(1_200_100, 56, sequence=255, duration=2,
+                   detail0=0x11223344, detail1=0x55667788,
+                   result=123, read_index=122),
+            record(1_200_200, 57, sequence=255, duration=91,
+                   detail0=0x01020304, detail1=0x05060708,
+                   result=0x10203040, write_index=123),
+        ])
+
+        records, _ = trace.parse_capture(capture)
+        self.assertEqual(
+            ["AUDIO_PCM_DISCONTINUITY", "AUDIO_G722_INTEGRITY_ERROR",
+             "USER_AUDIO_GLITCH_MARKER"],
+            [item.event for item in records],
+        )
+        self.assertIn("channels=left", trace.event_details(records[0]))
+        self.assertIn("stage=ring_checksum", trace.event_details(records[1]))
+        self.assertIn("latest_pcm_age_us=91",
+                      trace.event_details(records[2]))
+        self.assertIn("pcm_boundary_discontinuity",
+                      trace.anomaly_reasons(records[0]))
+        self.assertIn("g722_integrity_error",
+                      trace.anomaly_reasons(records[1]))
+        self.assertEqual([], trace.anomaly_reasons(records[2]))
+
+    def test_glitch_marker_command_uses_existing_cdc_command_frame(self):
+        frames = list(trace.iter_cobs_frames(
+            trace.build_audio_glitch_marker_command()
+        ))
+        self.assertEqual(1, len(frames))
+        packet_type, declared_length, connection_id, timestamp_ms = (
+            trace.PICO_HEADER.unpack_from(frames[0])
+        )
+        self.assertEqual(trace.PICO_TYPE_COMMAND, packet_type)
+        self.assertEqual(len(frames[0]), declared_length)
+        self.assertEqual(0, connection_id)
+        self.assertEqual(0, timestamp_ms)
+        command, status = trace.COMMAND_PACKET.unpack_from(
+            frames[0], trace.PICO_HEADER.size
+        )
+        self.assertEqual(trace.COMMAND_AUDIO_GLITCH_MARKER, command)
+        self.assertEqual(0, status)
+
     def test_runtime_snapshot_merges_with_legacy_snapshot(self):
         legacy_values = [500_000] + list(range(1, 22))
         legacy_body = trace.SNAPSHOT.pack(*legacy_values)
@@ -241,6 +392,48 @@ class ParseAudioStallTraceTest(unittest.TestCase):
             records, snapshots = trace.parse_capture(result.data)
             self.assertEqual(1, len(records))
             self.assertEqual([], snapshots)
+
+    def test_live_capture_can_send_nonblocking_glitch_marker(self):
+        class MarkerSerial:
+            writes: list[bytes] = []
+
+            def __init__(self, _port, *, baudrate, timeout):
+                self.baudrate = baudrate
+                self.timeout = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return None
+
+            @property
+            def in_waiting(self):
+                return 0
+
+            def write(self, data):
+                type(self).writes.append(data)
+                return len(data)
+
+            def read(self, _size):
+                return b""
+
+        with tempfile.TemporaryDirectory(dir=MODULE_PATH.parent) as directory:
+            raw_output = Path(directory) / "marker.bin"
+            marker_polls = iter((True,))
+            result = trace.capture_serial(
+                "COM-test", 0.01, 115200, raw_output,
+                serial_factory=MarkerSerial,
+                serial_errors=(OSError,),
+                mark_glitches=True,
+                marker_poll=lambda: next(marker_polls, False),
+            )
+
+        self.assertFalse(result.interrupted)
+        self.assertIsNone(result.error)
+        self.assertEqual(1, result.marker_count)
+        self.assertEqual([trace.build_audio_glitch_marker_command()],
+                         MarkerSerial.writes)
 
     def test_serial_error_preserves_partial_capture_and_closes_port(self):
         complete_packet = packet([record(200_000, 10, result=0x0800)])

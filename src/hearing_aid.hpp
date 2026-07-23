@@ -27,6 +27,23 @@ constexpr uint32_t ready_stuck_timeout_ticks = 3000;
 constexpr uint32_t audio_can_send_watchdog_us = 30'000;
 constexpr uint32_t audio_tx_max_audio_age_us = 60'000;
 constexpr uint32_t audio_packet_sent_watchdog_us = 150'000;
+// Each ASHA SDU contains 20 ms. Preserve at most 60 ms of fresh ordered audio
+// after a short credit drought; larger backlogs still collapse to newest.
+constexpr uint32_t audio_short_backlog_max_frames = 3;
+
+// Independent of the current CAN_SEND/PACKET_SENT phase: while fresh SDUs are
+// still arriving, a ready stream must make successful L2CAP progress.
+constexpr uint32_t audio_no_progress_timeout_us = 100'000;
+constexpr uint32_t audio_no_progress_rearm_deadline_us = 150'000;
+constexpr uint32_t audio_no_progress_startup_grace_us = 150'000;
+constexpr uint32_t audio_sdu_activity_timeout_us = 50'000;
+
+// Firmware-owned reconnects are bounded. One final watchdog reboot is allowed
+// per powered session after the normal attempts have all timed out.
+constexpr uint32_t reconnect_attempt_timeout_us = 12'000'000;
+constexpr uint32_t reconnect_initial_delay_us = 100'000;
+constexpr uint32_t reconnect_retry_backoff_us = 500'000;
+constexpr uint8_t reconnect_max_attempts = 3;
 
 enum class Side  {Left = 0, Right = 1};
 enum class Mode  {Mono = 0, Binaural = 1};
@@ -90,6 +107,20 @@ struct HearingAid
         WaitingPacketSent,
     };
 
+    enum class AudioNoProgressState : uint8_t {
+        Idle,
+        WaitingForRearmProgress,
+    };
+
+    enum class ReconnectState : uint8_t {
+        Idle,
+        Scheduled,
+        Scanning,
+        Connecting,
+        Initializing,
+        Failed,
+    };
+
     bool connected = false;
     bool cached    = false;
 
@@ -145,7 +176,8 @@ struct HearingAid
     static void start_scan();
     static void on_ad_report(const AdvertisingReport& report);
     static void connect(const bd_addr_t addr, bd_addr_type_t addr_type);
-    static void on_connected(bd_addr_t addr, hci_con_handle_t handle,
+    static void on_connected(uint8_t status, bd_addr_t addr,
+                             hci_con_handle_t handle,
                              uint16_t connection_interval, uint16_t peripheral_latency,
                              uint16_t supervision_timeout);
     static void on_disconnected(hci_con_handle_t handle, uint8_t status, uint8_t reason);
@@ -258,13 +290,33 @@ private:
     uint32_t audio_tx_ring_index = 0U;
     uint8_t audio_tx_sequence = AUDIO_STALL_TRACE_INVALID_SEQUENCE;
     bool audio_tx_local_recovery = false;
+    uint32_t audio_tx_generation = 0U;
+    uint32_t audio_tx_pending_generation = 0U;
+    uint8_t audio_tx_stale_can_send_callbacks = 0U;
+    bool l2cap_channel_open = false;
+
+    // Core-1-owned progress observations. The producer's atomic write index is
+    // the monotonic SDU generation count; successful sends are counted only
+    // after l2cap_send() accepts a complete audio SDU.
+    uint32_t audio_sdu_generated_count = 0U;
+    uint32_t audio_sdu_count_at_last_success = 0U;
+    uint32_t successful_audio_send_count = 0U;
+    uint32_t audio_progress_success_baseline = 0U;
+    uint32_t audio_no_progress_success_count = 0U;
+    uint32_t audio_last_sdu_generated_us = 0U;
+    uint64_t last_successful_audio_send_us = 0U;
+    uint64_t audio_progress_baseline_us = 0U;
+    uint64_t audio_progress_grace_deadline_us = 0U;
+    bool audio_progress_watchdog_armed = false;
+    AudioNoProgressState audio_no_progress_state = AudioNoProgressState::Idle;
+    uint64_t audio_no_progress_started_us = 0U;
+    uint64_t audio_no_progress_deadline_us = 0U;
 
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE
     uint64_t trace_can_send_request_us = 0U;
     uint64_t trace_can_send_now_us = 0U;
     uint64_t trace_l2cap_send_us = 0U;
     uint64_t trace_audio_busy_since_us = 0U;
-    uint64_t trace_last_successful_send_us = 0U;
     uint16_t trace_connection_interval = 0U;
     uint16_t trace_peripheral_latency = 0U;
     uint16_t trace_supervision_timeout = 0U;
@@ -272,6 +324,14 @@ private:
     uint8_t trace_last_sequence = AUDIO_STALL_TRACE_INVALID_SEQUENCE;
     bool trace_busy_stall_reported = false;
     bool trace_ring_underrun_reported = false;
+    bool trace_zero_credits_active = false;
+    uint64_t trace_zero_credits_since_us = 0U;
+    uint32_t trace_last_tx_blocker_mask = 0U;
+    uint64_t trace_last_tx_blocked_report_us = 0U;
+    bool trace_can_send_age_reported = false;
+    bool trace_packet_sent_age_reported = false;
+    uint32_t trace_audio_tx_checksum = 0U;
+    uint32_t trace_audio_tx_published_write_index = 0U;
 #endif
 
     bool stop_request_from_other = false;
@@ -285,6 +345,17 @@ private:
     inline static bool connections_allowed;
     inline static bool audio_streaming_enabled;
     inline static bool auto_pair_enabled;
+    inline static bool desired_connection = true;
+    inline static bool manual_shutdown = false;
+    inline static ReconnectState reconnect_state = ReconnectState::Idle;
+    inline static uint64_t reconnect_next_action_us = 0U;
+    inline static uint64_t reconnect_deadline_us = 0U;
+    inline static uint8_t reconnect_attempt_count = 0U;
+    inline static bool reconnect_watchdog_requested = false;
+    inline static uint16_t reconnect_handle = HCI_CON_HANDLE_INVALID;
+    inline static uint16_t reconnect_cid = 0U;
+    inline static uint32_t reconnect_read_index = 0U;
+    inline static std::array<uint8_t, 6> reconnect_address = {};
     inline static comm::BLEConnectionState ble_connection_state =
         comm::BLEConnectionState::Disconnected;
 #ifdef PICO_ASHA_AUDIO_STALL_TRACE_RSSI
@@ -301,6 +372,10 @@ private:
     static void set_other_side_ptrs();
     static void set_ble_connection_state(comm::BLEConnectionState state,
                                          bool force_event = false);
+    static void schedule_reconnect(HearingAid* ha, uint8_t status,
+                                   uint8_t reason);
+    static void process_reconnect();
+    static void clear_reconnect_reboot_guard();
     void assign_next_conn_id();
     bool is_connected();
     bool is_streaming();
@@ -312,6 +387,21 @@ private:
     bool request_audio_can_send(uint32_t write_index);
     bool send_pending_audio(bool local_recovery, uint32_t write_index);
     bool process_audio_tx_watchdog(uint32_t write_index, bool audio_active);
+    bool process_audio_no_progress(uint32_t write_index, bool pcm_is_streaming,
+                                   uint64_t now_us);
+    bool schedule_audio_if_idle(uint32_t write_index, uint64_t now_us,
+                                bool recovery);
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    uint32_t trace_audio_tx_blockers(uint32_t write_index,
+                                     bool pcm_is_streaming,
+                                     uint64_t now_us) const;
+    void trace_audio_tx_blocked_if_needed(uint32_t write_index,
+                                          bool pcm_is_streaming,
+                                          uint64_t now_us,
+                                          bool verify_invariant);
+#endif
+    void reset_audio_progress_watchdog(uint64_t now_us, bool armed);
+    void clear_local_audio_tx_state();
     void reconnect_after_audio_tx_stall(uint32_t write_index, uint32_t stalled_us,
                                         int32_t result);
     void set_data_langth();

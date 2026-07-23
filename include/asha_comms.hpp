@@ -122,6 +122,7 @@ namespace comm
         IntroPacket,
         PairBond,
         USBSettings,
+        AudioGlitchMarker,
     };
 
     enum class CmdStatus : uint8_t

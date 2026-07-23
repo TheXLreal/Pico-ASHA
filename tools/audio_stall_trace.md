@@ -26,8 +26,16 @@ To capture without the GUI (close the GUI first so it releases the CDC port):
 
 ```powershell
 python tools/parse_audio_stall_trace.py --capture-port COM7 `
-  --capture-seconds 120 --raw-output audio_stall_trace.bin
+  --capture-seconds 120 --raw-output audio_stall_trace.bin `
+  --mark-glitches
 ```
+
+With `--mark-glitches`, press `M` whenever an interruption or bad sound is
+heard. The parser sends the existing nonblocking CDC command format and the
+firmware inserts `USER_AUDIO_GLITCH_MARKER` into its own timestamp domain. The
+marker includes the age/checksum of the latest PCM block and checksums of the
+latest completed left/right G.722 SDU. Without the option, capture remains
+strictly read-only.
 
 `pyserial` is required only for live capture. An existing raw CDC capture can
 be parsed without dependencies:
@@ -72,7 +80,11 @@ the parser with the snapshot at the same timestamp. Its fields are:
 - `btstack_run_loop_gap_last_us`, `btstack_run_loop_gap_max_us`;
 - `hci_to_packet_sent_last_us`, `hci_to_packet_sent_max_us`;
 - RSSI values/ages, sample and skipped-request counts;
-- stale-SDU drop count and dropped-frame count.
+- stale-SDU drop count and dropped-frame count;
+- core-1 run-loop and `process_audio()` counts plus their latest ages;
+- HCI transport-write and controller-event progress counts plus their latest
+  ages. The 64-bit snapshot timestamp minus an age gives the progress
+  timestamp without a 32-bit timer-wrap ambiguity.
 
 Event IDs 19-25 are `AUDIO_TX_STALE_DROP`, `HCI_WRITE_BEGIN`,
 `HCI_WRITE_END`, `CYW43_LOCK_WAIT_BEGIN`, `CYW43_LOCK_ACQUIRED`,
@@ -90,6 +102,80 @@ Event IDs 26-39 add the precise stall/lifecycle diagnostics:
   `L2CAP_CHANNEL_OPENED`, `L2CAP_CHANNEL_CLOSED`,
   `ASHA_DEVICE_CONNECTED`, and `ASHA_DEVICE_DISCONNECTED`;
 - `SYSTEM_BOOT` and `WATCHDOG_RESET_REQUESTED`.
+
+Event IDs 40-47 cover the final recovery flow:
+
+- `AUDIO_NO_PROGRESS`, `AUDIO_NO_PROGRESS_REARMED`, and
+  `AUDIO_NO_PROGRESS_RECONNECT`;
+- `RECONNECT_SCHEDULED`, `SCAN_START_REQUESTED`, `CONNECT_ATTEMPT`,
+  `CONNECT_COMPLETE`, and `RECONNECT_TIMEOUT`.
+
+Event IDs 48-49 are `AUDIO_CREDITS_ZERO_ENTER` and
+`AUDIO_CREDITS_ZERO_EXIT`. They are emitted only on a zero-credit state change
+and report its duration, restored credit count, and the latest RSSI sample/age.
+
+Event IDs 50-54 isolate the unresolved TX stall without adding per-packet
+logging:
+
+- `CORE1_RUN_LOOP_HEARTBEAT` and `PROCESS_AUDIO_ENTER` are rate-limited to one
+  record per second; their counters/ages are also sampled every 250 ms;
+- `TX_BLOCKED` is emitted only after 50 ms without successful send progress
+  while a fresh SDU is waiting, then only when its blocker mask changes or once
+  per second;
+- `CAN_SEND_REQUEST_AGE` is emitted once per request after 25 ms in
+  `WaitingCanSendNow`;
+- `PACKET_SENT_WAIT_AGE` is emitted once per SDU after 50 ms in
+  `WaitingPacketSent`.
+
+`TX_BLOCKED` blocker bits are: `not_connected`, `not_streaming`,
+`l2cap_not_ready`, `no_sdu_available`, `sdu_not_fresh`,
+`waiting_can_send_now`, `waiting_packet_sent`, `can_send_pending`,
+`audio_busy`, `no_credits`, `pcm_not_streaming`, `audio_disabled`,
+`process_not_audio`, `connections_disabled`, `tx_buffer_owned`, and
+`invariant_not_armed`. The last value means the full ready/fresh/idle invariant
+still held after the normal scheduling pass but no request owned the TX path.
+The parser expands the bitmask into names and reports credits, TX state, SDU
+age, and HCI transport/controller progress ages.
+
+Event IDs 55-57 target audible corruption without adding continuous logging:
+
+- `AUDIO_PCM_DISCONTINUITY` is emitted only when the boundary between adjacent
+  PCM blocks jumps by at least 24,576 sample units on either channel. It is a
+  candidate click/corruption marker, not proof that normal loud content is
+  invalid;
+- `AUDIO_G722_INTEGRITY_ERROR` is emitted only if the encoder-ring generation
+  changes during selection, the copied SDU checksum differs from its published
+  checksum, or the private TX buffer changes before `l2cap_send()`;
+- `USER_AUDIO_GLITCH_MARKER` is emitted only for an explicit `M` key marker.
+
+The per-SDU checks use a small FNV-1a fingerprint and never gate, retry, drop,
+or otherwise change audio scheduling. PCM candidates and each integrity-error
+stage are rate-limited to one record per 100 ms. Progress and RSSI age
+snapshots clamp a concurrent timestamp newer than the snapshot to zero,
+avoiding unsigned near-`UINT32_MAX` diagnostic values.
+
+`AUDIO_NO_PROGRESS` requires an open, connected and actively streaming ASHA
+channel, SDU production observed within 50 ms, at least one SDU generated since
+the send baseline, and no successful L2CAP send for 100 ms. Detection is
+deliberately independent of ring-fill/read-index bookkeeping, `AudioBusy`, TX
+phase, and available credits. A 150-ms startup grace is reset for each stream
+or L2CAP generation. First-tier recovery retains the newest complete SDU and
+re-arms one normal CAN_SEND request when the private TX buffer is safe to
+replace. If BTstack already owns a request/buffer, the existing phase watchdog
+continues without a duplicate request. No successful send within the following
+150 ms causes the bounded reconnect flow.
+
+Snapshot `ring_fill_current` is recomputed from the producer write index and
+registered consumer read indices at snapshot time. An individual event's
+`ring_fill` still describes that event's captured indices (including pre-drop
+indices), so it can legitimately differ from a later snapshot.
+
+Transient L2CAP credit exhaustion no longer issues ACP Stop/Start. The active
+ASHA stream waits for flow-control credit while the existing phase and
+no-progress watchdogs remain armed. When credit returns, up to three queued
+20-ms SDUs (at most 60 ms) are sent in sequence so a single fresh G.722 frame
+is not discarded. Recovery or a larger backlog still collapses to the newest
+complete SDU. USB PCM gap handling remains unchanged.
 
 Stale recovery uses two records with the same timestamp so the version-1
 40-byte wire record remains unchanged. `AUDIO_STALE_FRAMES_DROPPED` captures

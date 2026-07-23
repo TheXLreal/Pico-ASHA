@@ -22,6 +22,12 @@ extern "C" {
 #define AUDIO_STALL_TRACE_HCI_WRITE_SLOW_US 5000u
 #define AUDIO_STALL_TRACE_CYW43_LOCK_WAIT_SLOW_US 1000u
 #define AUDIO_STALL_TRACE_CYW43_LOCK_HELD_SLOW_US 5000u
+#define AUDIO_STALL_TRACE_HEARTBEAT_INTERVAL_US 1000000u
+#define AUDIO_STALL_TRACE_TX_BLOCKED_US 50000u
+#define AUDIO_STALL_TRACE_CAN_SEND_AGE_US 25000u
+#define AUDIO_STALL_TRACE_PACKET_SENT_AGE_US 50000u
+#define AUDIO_STALL_TRACE_PCM_DISCONTINUITY_THRESHOLD 24576u
+#define AUDIO_STALL_TRACE_CONTENT_EVENT_MIN_INTERVAL_US 100000u
 
 enum AudioStallTraceEvent {
     AUDIO_STALL_TRACE_SDU_GENERATED = 1,
@@ -63,6 +69,24 @@ enum AudioStallTraceEvent {
     AUDIO_STALL_TRACE_ASHA_DEVICE_DISCONNECTED,
     AUDIO_STALL_TRACE_SYSTEM_BOOT,
     AUDIO_STALL_TRACE_WATCHDOG_RESET_REQUESTED,
+    AUDIO_STALL_TRACE_AUDIO_NO_PROGRESS,
+    AUDIO_STALL_TRACE_AUDIO_NO_PROGRESS_REARMED,
+    AUDIO_STALL_TRACE_AUDIO_NO_PROGRESS_RECONNECT,
+    AUDIO_STALL_TRACE_RECONNECT_SCHEDULED,
+    AUDIO_STALL_TRACE_SCAN_START_REQUESTED,
+    AUDIO_STALL_TRACE_CONNECT_ATTEMPT,
+    AUDIO_STALL_TRACE_CONNECT_COMPLETE,
+    AUDIO_STALL_TRACE_RECONNECT_TIMEOUT,
+    AUDIO_STALL_TRACE_CREDITS_ZERO_ENTER,
+    AUDIO_STALL_TRACE_CREDITS_ZERO_EXIT,
+    AUDIO_STALL_TRACE_CORE1_RUN_LOOP_HEARTBEAT,
+    AUDIO_STALL_TRACE_PROCESS_AUDIO_ENTER,
+    AUDIO_STALL_TRACE_TX_BLOCKED,
+    AUDIO_STALL_TRACE_CAN_SEND_REQUEST_AGE,
+    AUDIO_STALL_TRACE_PACKET_SENT_WAIT_AGE,
+    AUDIO_STALL_TRACE_PCM_DISCONTINUITY,
+    AUDIO_STALL_TRACE_G722_INTEGRITY_ERROR,
+    AUDIO_STALL_TRACE_USER_AUDIO_GLITCH_MARKER,
 };
 
 /* Descriptive aliases for the original version-1 event IDs. */
@@ -87,6 +111,7 @@ enum AudioStallTraceWatchdogReason {
     AUDIO_STALL_TRACE_WATCHDOG_HCI_DUMP_SETTING = 1,
     AUDIO_STALL_TRACE_WATCHDOG_RESTART_COMMAND,
     AUDIO_STALL_TRACE_WATCHDOG_USB_SETTING,
+    AUDIO_STALL_TRACE_WATCHDOG_RECONNECT_FALLBACK,
 };
 
 enum AudioStallTracePayloadKind {
@@ -100,6 +125,31 @@ enum AudioStallTraceBusyContext {
     AUDIO_STALL_TRACE_BUSY_CONTEXT_AUDIO_SDU,
     AUDIO_STALL_TRACE_BUSY_CONTEXT_PACKET_SENT,
     AUDIO_STALL_TRACE_BUSY_CONTEXT_RESET,
+};
+
+enum AudioStallTraceTxBlocker {
+    AUDIO_STALL_TRACE_BLOCK_NOT_CONNECTED = 1u << 0,
+    AUDIO_STALL_TRACE_BLOCK_NOT_STREAMING = 1u << 1,
+    AUDIO_STALL_TRACE_BLOCK_L2CAP_NOT_READY = 1u << 2,
+    AUDIO_STALL_TRACE_BLOCK_NO_SDU_AVAILABLE = 1u << 3,
+    AUDIO_STALL_TRACE_BLOCK_SDU_NOT_FRESH = 1u << 4,
+    AUDIO_STALL_TRACE_BLOCK_WAIT_CAN_SEND_NOW = 1u << 5,
+    AUDIO_STALL_TRACE_BLOCK_WAIT_PACKET_SENT = 1u << 6,
+    AUDIO_STALL_TRACE_BLOCK_CAN_SEND_PENDING = 1u << 7,
+    AUDIO_STALL_TRACE_BLOCK_AUDIO_BUSY = 1u << 8,
+    AUDIO_STALL_TRACE_BLOCK_NO_CREDITS = 1u << 9,
+    AUDIO_STALL_TRACE_BLOCK_PCM_NOT_STREAMING = 1u << 10,
+    AUDIO_STALL_TRACE_BLOCK_AUDIO_DISABLED = 1u << 11,
+    AUDIO_STALL_TRACE_BLOCK_PROCESS_NOT_AUDIO = 1u << 12,
+    AUDIO_STALL_TRACE_BLOCK_CONNECTIONS_DISABLED = 1u << 13,
+    AUDIO_STALL_TRACE_BLOCK_TX_BUFFER_OWNED = 1u << 14,
+    AUDIO_STALL_TRACE_BLOCK_INVARIANT_NOT_ARMED = 1u << 15,
+};
+
+enum AudioStallTraceG722IntegrityStage {
+    AUDIO_STALL_TRACE_G722_RING_GENERATION = 1,
+    AUDIO_STALL_TRACE_G722_RING_CHECKSUM,
+    AUDIO_STALL_TRACE_G722_TX_BUFFER_CHANGED,
 };
 
 #if defined(_MSC_VER)
@@ -191,6 +241,14 @@ typedef struct AUDIO_STALL_TRACE_WIRE_STRUCT AudioStallTraceRuntimeSnapshot {
     uint32_t rssi_slot1_age_us;
     uint32_t tx_stale_drop_count;
     uint32_t tx_stale_drop_frames;
+    uint32_t core1_run_loop_count;
+    uint32_t core1_run_loop_age_us;
+    uint32_t process_audio_enter_count;
+    uint32_t process_audio_enter_age_us;
+    uint32_t hci_transport_progress_count;
+    uint32_t hci_transport_progress_age_us;
+    uint32_t hci_controller_progress_count;
+    uint32_t hci_controller_progress_age_us;
 } AudioStallTraceRuntimeSnapshot;
 
 #if defined(_MSC_VER)
@@ -202,12 +260,12 @@ typedef struct AUDIO_STALL_TRACE_WIRE_STRUCT AudioStallTraceRuntimeSnapshot {
 static_assert(sizeof(AudioStallTraceRecord) == 40);
 static_assert(sizeof(AudioStallTracePacketHeader) == 8);
 static_assert(sizeof(AudioStallTraceSnapshot) == 92);
-static_assert(sizeof(AudioStallTraceRuntimeSnapshot) == 88);
+static_assert(sizeof(AudioStallTraceRuntimeSnapshot) == 120);
 #else
 _Static_assert(sizeof(AudioStallTraceRecord) == 40, "Unexpected trace record size");
 _Static_assert(sizeof(AudioStallTracePacketHeader) == 8, "Unexpected trace header size");
 _Static_assert(sizeof(AudioStallTraceSnapshot) == 92, "Unexpected trace snapshot size");
-_Static_assert(sizeof(AudioStallTraceRuntimeSnapshot) == 88,
+_Static_assert(sizeof(AudioStallTraceRuntimeSnapshot) == 120,
                "Unexpected runtime snapshot size");
 #endif
 
@@ -252,7 +310,19 @@ void audio_stall_trace_ble_connect(uint16_t handle, uint16_t cid, uint8_t sequen
                                    uint16_t interval, uint16_t latency,
                                    uint16_t supervision_timeout);
 void audio_stall_trace_audio_timer_tick(uint64_t now_us);
+void audio_stall_trace_process_audio_enter(uint64_t now_us,
+                                           uint32_t write_index);
 void audio_stall_trace_usb_pcm_underrun(uint32_t gap_us, uint32_t write_index);
+void audio_stall_trace_pcm_discontinuity(
+    uint8_t sequence, uint32_t write_index, uint32_t gap_us,
+    uint32_t left_jump, uint32_t right_jump, uint16_t sample_count,
+    uint8_t channel_flags);
+void audio_stall_trace_g722_integrity_error(
+    uint16_t handle, uint16_t cid, uint8_t sequence,
+    uint32_t write_index, uint32_t selected_ring_index, bool busy,
+    uint8_t stage, uint32_t expected_value, uint32_t actual_value,
+    uint32_t observed_generation);
+void audio_stall_trace_user_audio_glitch_marker(void);
 void audio_stall_trace_rssi(uint16_t handle, uint16_t cid, uint8_t sequence,
                             uint32_t write_index, uint32_t read_index, bool busy, int8_t rssi);
 void audio_stall_trace_rssi_request_skipped(void);
@@ -284,8 +354,33 @@ void audio_stall_trace_bluetooth_lifecycle(
     bool busy);
 void audio_stall_trace_watchdog_reset_requested(uint8_t reason,
                                                 uint32_t delay_ms);
+void audio_stall_trace_audio_no_progress(
+    uint8_t event_type, uint16_t handle, uint16_t cid, uint8_t sequence,
+    uint32_t write_index, uint32_t read_index, bool busy,
+    uint32_t last_send_age_us, uint32_t newest_sdu_age_us,
+    uint8_t tx_state, uint16_t available_credits, int32_t result);
+void audio_stall_trace_reconnect_transition(
+    uint8_t event_type, uint16_t handle, uint16_t cid,
+    const uint8_t address[6], uint32_t write_index, uint32_t read_index,
+    uint8_t attempt, uint8_t hci_status, uint8_t hci_reason,
+    int32_t result);
+void audio_stall_trace_credits_zero(
+    uint8_t event_type, uint16_t handle, uint16_t cid, uint8_t sequence,
+    uint32_t write_index, uint32_t read_index, bool busy,
+    uint32_t duration_us, uint16_t available_credits);
+void audio_stall_trace_tx_blocked(
+    uint16_t handle, uint16_t cid, uint8_t sequence,
+    uint32_t write_index, uint32_t read_index, bool busy,
+    uint32_t last_send_age_us, uint32_t blocker_mask,
+    uint32_t newest_sdu_age_us, uint8_t tx_state,
+    uint16_t available_credits, bool can_send_pending);
+void audio_stall_trace_tx_wait_age(
+    uint8_t event_type, uint16_t handle, uint16_t cid, uint8_t sequence,
+    uint32_t write_index, uint32_t read_index, bool busy,
+    uint32_t wait_age_us, uint8_t tx_state, uint16_t available_credits);
 void audio_stall_trace_hci_write(uint64_t begin_us, uint64_t end_us,
                                  uint8_t packet_type, int32_t result);
+void audio_stall_trace_hci_controller_progress(uint64_t now_us);
 void audio_stall_trace_cyw43_lock_acquired(uint64_t begin_us, uint64_t acquired_us);
 void audio_stall_trace_cyw43_lock_released(uint64_t acquired_us, uint64_t released_us);
 

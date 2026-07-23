@@ -208,6 +208,11 @@ static void process_serial_cmds()
                     }
                 }
                 break;
+            case Command::AudioGlitchMarker:
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+                audio_stall_trace_user_audio_glitch_marker();
+#endif
+                break;
             default:
                 cmd_pkt.cmd_status = CmdStatus::CmdError;
                 break;
@@ -292,6 +297,9 @@ void delay_start_timer_handler(btstack_timer_source_t *timer)
 static void hci_event_handler(PACKET_HANDLER_PARAMS)
 {
     if (packet_type != HCI_EVENT_PACKET) { return; }
+#ifdef PICO_ASHA_AUDIO_STALL_TRACE
+    audio_stall_trace_hci_controller_progress(audio_stall_trace_now_us());
+#endif
 
     bd_addr_t local_addr;
     uint8_t hci_ev_type = hci_event_packet_get_type(packet);
@@ -344,6 +352,7 @@ static void hci_event_handler(PACKET_HANDLER_PARAMS)
                     write_index, false);
 #endif
                 HearingAid::on_connected(
+                    gap_subevent_le_connection_complete_get_status(packet),
                     addr, handle,
                     gap_subevent_le_connection_complete_get_conn_interval(packet),
                     gap_subevent_le_connection_complete_get_conn_latency(packet),
