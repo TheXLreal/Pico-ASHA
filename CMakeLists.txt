@@ -4,9 +4,9 @@ if(WIN32)
 else()
     set(USERHOME $ENV{HOME})
 endif()
-set(sdkVersion 2.2.0)
+set(sdkVersion 2.3.0)
 set(toolchainVersion 14_2_Rel1)
-set(picotoolVersion 2.2.0)
+set(picotoolVersion 2.3.0)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
@@ -56,8 +56,8 @@ add_compile_definitions(
 pico_sdk_init()
 
 message("Pico SDK version is ${PICO_SDK_VERSION_STRING}")
-if(PICO_SDK_VERSION_STRING VERSION_LESS "2.2.0")
-  message( FATAL_ERROR "Pico SDK version must be 2.2.0 or greater" )
+if(PICO_SDK_VERSION_STRING VERSION_LESS "2.3.0")
+  message( FATAL_ERROR "Pico SDK version must be 2.3.0 or greater" )
 endif()
 
 FetchContent_Declare(

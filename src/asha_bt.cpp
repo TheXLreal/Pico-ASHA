@@ -113,6 +113,10 @@ extern "C" void bt_main()
        paired hearing aids */
     //LOG_INFO("SM Init.");
     sm_init();
+    // BTstack 1.8.2 (Pico SDK 2.3.0) raised the default minimum encryption
+    // key size from 7 to 16. Keep the previous range because Pico-ASHA
+    // deliberately falls back to legacy pairing for older hearing aids.
+    sm_set_encryption_key_size_range(7, 16);
     sm_set_secure_connections_only_mode(false);
     sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
     sm_set_authentication_requirements(HearingAid::auth_req);
