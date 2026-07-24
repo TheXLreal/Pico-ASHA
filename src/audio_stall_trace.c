@@ -12,7 +12,14 @@
 
 #include "asha_audio.h"
 
+#if PICO_RP2040
+/* RP2040 has substantially less free SRAM after the Bluetooth/audio image is
+ * copied to RAM. Keep a smaller diagnostic backlog on Pico W so the firmware
+ * still links. Dropped records remain visible through trace_dropped. */
+#define TRACE_RING_SIZE 16u
+#else
 #define TRACE_RING_SIZE 256u
+#endif
 #define TRACE_RING_MASK (TRACE_RING_SIZE - 1u)
 #define TRACE_CONSUMER_SLOTS 2u
 #define TRACE_CONNECTION_SLOTS 2u
@@ -24,7 +31,14 @@
 #define PICO_ASHA_FW_VERS_PATCH 0u
 #endif
 
+#if PICO_RP2040
+/* RP2040 has no lock-free C11 atomics. Pico SDK 2.x supplies the same
+ * __atomic operations through pico_atomic, backed by the SDK-reserved
+ * PICO_SPINLOCK_ID_ATOMIC spin lock. The trace remains atomic and safe
+ * across both cores and IRQs, but is intentionally not lock-free here. */
+#else
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "Trace ring indices must be lock-free");
+#endif
 
 typedef struct TraceRing {
     atomic_uint write_index;

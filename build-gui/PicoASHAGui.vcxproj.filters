@@ -1,0 +1,81 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="C:\Cochlear\Pico-ASHA\build-gui\PicoASHAGui_autogen\mocs_compilation_Debug.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Cochlear\Pico-ASHA\gui\main.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Cochlear\Pico-ASHA\gui\picoashacomm.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Cochlear\Pico-ASHA\gui\remotedevice.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Cochlear\Pico-ASHA\gui\rssihistorygraph.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Cochlear\Pico-ASHA\lib\nanocobs\cobs.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Cochlear\Pico-ASHA\gui\picoashamainwindow.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Cochlear\Pico-ASHA\gui\pairdialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Cochlear\Pico-ASHA\build-gui\PicoASHAGui_autogen\mocs_compilation_Release.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Cochlear\Pico-ASHA\build-gui\PicoASHAGui_autogen\mocs_compilation_MinSizeRel.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Cochlear\Pico-ASHA\build-gui\PicoASHAGui_autogen\mocs_compilation_RelWithDebInfo.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="C:\Cochlear\Pico-ASHA\gui\picoashacomm.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="C:\Cochlear\Pico-ASHA\gui\remotedevice.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="C:\Cochlear\Pico-ASHA\gui\rssihistorygraph.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="C:\Cochlear\Pico-ASHA\include\asha_comms.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="C:\Cochlear\Pico-ASHA\src\audio_stall_trace.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="C:\Cochlear\Pico-ASHA\include\bt_status_err.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="C:\Cochlear\Pico-ASHA\gui\picoashamainwindow.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="C:\Cochlear\Pico-ASHA\gui\pairdialog.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="C:\Cochlear\Pico-ASHA\gui\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="C:\Cochlear\Pico-ASHA\gui\timestamp_Debug" />
+    <None Include="C:\Cochlear\Pico-ASHA\gui\timestamp_Release" />
+    <None Include="C:\Cochlear\Pico-ASHA\gui\timestamp_MinSizeRel" />
+    <None Include="C:\Cochlear\Pico-ASHA\gui\timestamp_RelWithDebInfo" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{F3EE4A40-7215-3F0D-8C92-67024FB7349D}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{E224389D-43D5-31B2-8A5F-F0EB216C6EDB}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

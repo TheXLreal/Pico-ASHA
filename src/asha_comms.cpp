@@ -65,12 +65,21 @@ namespace comm
     // trace packets are produced by usb_main() on core 0. TinyUSB is owned by
     // core 0, so all complete COBS frames pass through this bounded,
     // non-blocking MPSC queue before they are written.
+#if PICO_RP2040
+    // Each frame reserves a full 256-byte COBS buffer. Pico W cannot afford
+    // the 32-frame Pico 2 W queue while also keeping the trace rings in SRAM.
+    constexpr uint32_t usb_tx_queue_size = 8;
+    constexpr uint32_t usb_tx_hci_reserve = 2;
+#else
     constexpr uint32_t usb_tx_queue_size = 32;
+    constexpr uint32_t usb_tx_hci_reserve = 8;
+#endif
     constexpr uint32_t usb_tx_queue_mask = usb_tx_queue_size - 1;
-    constexpr uint32_t usb_tx_hci_limit = usb_tx_queue_size - 8;
+    constexpr uint32_t usb_tx_hci_limit = usb_tx_queue_size - usb_tx_hci_reserve;
     constexpr uint32_t usb_tx_send_limit = 4;
     constexpr uint32_t usb_tx_enqueue_attempts = 4;
     static_assert((usb_tx_queue_size & usb_tx_queue_mask) == 0);
+    static_assert(usb_tx_hci_reserve < usb_tx_queue_size);
 
     struct USBTxFrame
     {
@@ -82,8 +91,14 @@ namespace comm
     static std::array<USBTxFrame, usb_tx_queue_size> usb_tx_queue;
     static std::atomic_uint32_t usb_tx_write_index = 0;
     static std::atomic_uint32_t usb_tx_read_index = 0;
+#if PICO_RP2040
+    // RP2040 atomics are implemented by Pico SDK's pico_atomic library using
+    // the SDK-reserved atomic spin lock. They are safe across cores and IRQs,
+    // although std::atomic correctly reports that they are not lock-free.
+#else
     static_assert(std::atomic_uint32_t::is_always_lock_free);
     static_assert(std::atomic_bool::is_always_lock_free);
+#endif
 
     constexpr size_t trace_records_per_packet = 5;
     constexpr size_t max_trace_decoded_size = sizeof(HeaderPacket) +

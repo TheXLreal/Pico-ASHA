@@ -1,0 +1,40 @@
+^C:\COCHLEAR\PICO-ASHA\BUILD-GUI\CMAKEFILES\894C82002D6677E11CADA2E56A4887F2\TIMESTAMP_(CONFIG).RULE
+setlocal
+cd C:\Cochlear\Pico-ASHA\build-gui
+if %errorlevel% neq 0 goto :cmEnd
+C:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E cmake_autogen C:/Cochlear/Pico-ASHA/build-gui/CMakeFiles/PicoASHAGui_autogen.dir/AutogenInfo.json Release
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch C:/Cochlear/Pico-ASHA/build-gui/PicoASHAGui_autogen/timestamp_Release
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E cmake_transform_depfile "Visual Studio 17 2022" MSBuildAdditionalInputs C:/Cochlear/Pico-ASHA/gui C:/Cochlear/Pico-ASHA/gui C:/Cochlear/Pico-ASHA/build-gui C:/Cochlear/Pico-ASHA/build-gui C:/Cochlear/Pico-ASHA/build-gui/PicoASHAGui_autogen/deps_Release C:/Cochlear/Pico-ASHA/build-gui/CMakeFiles/d/a3dcbcc7a69e5940f7d3a5f7f830d777717f8817695cf193c229ac07116a76c3.AdditionalInputs
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^C:\COCHLEAR\PICO-ASHA\BUILD-GUI\CMAKEFILES\2744E3FC97C655E1E8C8F78DB206A575\PICOASHAGUI_AUTOGEN.RULE
+setlocal
+cd C:\Cochlear\Pico-ASHA\build-gui
+if %errorlevel% neq 0 goto :cmEnd
+C:
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^C:\COCHLEAR\PICO-ASHA\GUI\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Cochlear/Pico-ASHA/gui -BC:/Cochlear/Pico-ASHA/build-gui --check-stamp-file C:/Cochlear/Pico-ASHA/build-gui/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

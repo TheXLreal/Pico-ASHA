@@ -1,0 +1,20 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <ProjectOutputs>
+    <ProjectOutput>
+      <FullPath>C:\Cochlear\Pico-ASHA\build-gui\x64\Release\ZERO_CHECK</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Cochlear\Pico-ASHA\build-gui\x64\Release\PicoASHAGui_autogen_timestamp_deps</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Cochlear\Pico-ASHA\build-gui\x64\Release\PicoASHAGui_autogen</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Cochlear\Pico-ASHA\build-gui\Release\PicoASHAGui.exe</FullPath>
+    </ProjectOutput>
+  </ProjectOutputs>
+  <ContentFiles />
+  <SatelliteDlls />
+  <NonRecipeFileRefs />
+</Project>
