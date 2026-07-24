@@ -14,6 +14,11 @@ static constexpr uint16_t pdu_len = 167u;
 
 static constexpr uint16_t max_tx_time = (pdu_len + 14) * 8;
 
+// Android's mandatory G.722 @ 16 kHz / 20 ms link parameters.
+static constexpr uint16_t asha_conn_interval = 0x0010;
+static constexpr uint16_t asha_conn_latency = 0x000A;
+static constexpr uint16_t asha_supervision_timeout = 0x0064;
+
 static constexpr size_t ev_packet_str_size = sizeof comm::EventPacket::data.str;
 
 static constexpr int max_error_count = 10;
@@ -42,6 +47,9 @@ namespace ACPStatus
 }
 
 static bool gatt_service_valid(gatt_client_service_t* service);
+static bool gatt_characteristic_valid(gatt_client_characteristic_t* characteristic);
+static bool gatt_characteristic_supports(gatt_client_characteristic_t* characteristic,
+                                         uint16_t property);
 
 static void delete_paired_devices();
 static void delete_paired_device(const bd_addr_t address);
@@ -49,6 +57,18 @@ static void delete_paired_device(const bd_addr_t address);
 static bool gatt_service_valid(gatt_client_service_t* service)
 {
     return service->end_group_handle > 0U;
+}
+
+static bool gatt_characteristic_valid(gatt_client_characteristic_t* characteristic)
+{
+    return characteristic->value_handle > 0U;
+}
+
+static bool gatt_characteristic_supports(gatt_client_characteristic_t* characteristic,
+                                         uint16_t property)
+{
+    return gatt_characteristic_valid(characteristic)
+        && (characteristic->properties & property) != 0u;
 }
 
 /* Get value from (sub) array of bytes */
@@ -112,16 +132,20 @@ void HearingAid::process()
                 break;
             case DataLength:
                 ev_type = EventType::DLE;
-                //LOG_INFO("%s: Setting data length",  ha->get_side_str())
-                // If the controller can't take the command yet, yield and retry on
-                // the next tick rather than spinning the run loop. Advance to
-                // discovery right after sending: the controller only emits
-                // HCI_SUBEVENT_LE_DATA_LENGTH_CHANGE when the effective length
-                // actually changes, so an aid already at the requested size would
-                // never fire it and we'd stall waiting.
-                if (!hci_can_send_command_packet_now()) { break; }
-                ha->set_data_langth();
-                ha->process_state = DiscoverChars;
+                // DLE can be a no-op and therefore does not always produce a
+                // change event. The connection update, however, must be complete
+                // before ASHA streaming starts. A connection already created with
+                // Android's parameters can advance immediately.
+                if (ha->connection_update_pending || !hci_can_send_command_packet_now()) break;
+                ha->set_data_length();
+                if (ha->connection_interval == asha_conn_interval
+                    && ha->connection_latency == asha_conn_latency) {
+                    ha->process_state = DiscoverChars;
+                    break;
+                }
+                if (!ha->connection_update_pending) {
+                    res = ha->request_connection_parameters();
+                }
                 break;
             case DiscoverChars: {
                 ha->set_process_busy();
@@ -219,6 +243,7 @@ std::array<HearingAid*,2> HearingAid::connected_has()
     for (auto ha : hearing_aids) {
         if (ha->is_connected()) {
             has[i] = ha;
+            ++i;
         }
     }
     return has;
@@ -351,7 +376,8 @@ void HearingAid::connect(const bd_addr_t addr, bd_addr_type_t addr_type)
     gap_connect(addr, addr_type);
 }
 
-void HearingAid::on_connected(bd_addr_t addr, hci_con_handle_t handle)
+void HearingAid::on_connected(bd_addr_t addr, hci_con_handle_t handle,
+                              uint16_t conn_interval, uint16_t conn_latency)
 {
     using namespace comm;
 
@@ -360,6 +386,9 @@ void HearingAid::on_connected(bd_addr_t addr, hci_con_handle_t handle)
         //LOG_INFO("%s: Connected to cached HA", bd_addr_to_str(addr));
         ha_cached->connected = true;
         ha_cached->conn_handle = handle;
+        ha_cached->connection_interval = conn_interval;
+        ha_cached->connection_latency = conn_latency;
+        ha_cached->connection_update_pending = false;
         set_other_side_ptrs();
         ha_cached->assign_next_conn_id();
 
@@ -378,6 +407,9 @@ void HearingAid::on_connected(bd_addr_t addr, hci_con_handle_t handle)
         ha->cached = false;
         bd_addr_copy(ha->addr, addr);
         ha->conn_handle = handle;
+        ha->connection_interval = conn_interval;
+        ha->connection_latency = conn_latency;
+        ha->connection_update_pending = false;
         set_other_side_ptrs();
         ha->assign_next_conn_id();
 
@@ -399,6 +431,7 @@ void HearingAid::on_disconnected(hci_con_handle_t handle, uint8_t status, uint8_
 {
     using namespace comm;
     HearingAid* ha = get_by_con_handle(handle);
+    if (!ha) return;
     // if (ha->process_state == ProcessState::Disconnect) {
     //     LOG_INFO("%s: Disconnected", ha->get_side_str());
     // } else {
@@ -415,6 +448,7 @@ void HearingAid::on_disconnected(hci_con_handle_t handle, uint8_t status, uint8_
     ha->connected = false;
     set_other_side_ptrs();
     ha->reset();
+    stop_audio_encoder_if_idle();
     int num_c = num_connected();
     if (num_c == 1) {
         led_mgr.set_led_pattern(one_connected);
@@ -431,15 +465,48 @@ void HearingAid::on_data_len_set(hci_con_handle_t handle,
     [[maybe_unused]] uint16_t tx_time)
 {
     HearingAid* ha = get_by_con_handle(handle);
+    if (!ha) return;
 
     // DLE changes are handled asynchronously: the DataLength process state issues
     // the set-data-length command and advances to DiscoverChars itself, rather than
     // waiting on this event (which the controller doesn't emit when the effective
     // data length is unchanged). This handler is now informational only.
-    (void)ha;
+    if (tx_octets < pdu_len) {
+        comm::short_log(ha->conn_id, "DLE TX too short: %u", tx_octets);
+    }
     // LOG_INFO("%s: DL set to: RX Octets: %hu, RX Time: %hu us, TX Octets: %hu, TX Time: %hu us",
     //                     ha->get_side_str(),
     //                     rx_octets, rx_time, tx_octets, tx_time);
+}
+
+void HearingAid::on_connection_update(hci_con_handle_t handle, uint8_t status,
+                                      uint16_t conn_interval, uint16_t conn_latency)
+{
+    HearingAid* ha = get_by_con_handle(handle);
+    if (!ha) return;
+
+    ha->connection_update_pending = false;
+    if (status != ERROR_CODE_SUCCESS) {
+        comm::add_event_to_buffer(ha->conn_id,
+            comm::EventPacket(comm::EventType::DLE, comm::StatusType::BtstackStatus, status));
+        ++ha->error_count;
+        ha->process_delay_ticks = ha_process_delay_ticks;
+        return;
+    }
+
+    ha->connection_interval = conn_interval;
+    ha->connection_latency = conn_latency;
+    if (ha->other && ha->other->is_streaming()) {
+        ha->other->send_acp_status(ACPStatus::conn_param_updated);
+    }
+
+    if (conn_interval == asha_conn_interval && conn_latency == asha_conn_latency
+        && ha->process_state == ProcessState::DataLength) {
+        ha->process_state = ProcessState::DiscoverChars;
+    } else if (ha->process_state == ProcessState::DataLength) {
+        ++ha->error_count;
+        ha->process_delay_ticks = ha_process_delay_ticks;
+    }
 }
 
 void HearingAid::delete_pair()
@@ -700,14 +767,29 @@ void HearingAid::handle_char_discovery(PACKET_HANDLER_PARAMS)
             handle = gatt_event_query_complete_get_handle(packet);
             att_status = gatt_event_query_complete_get_att_status(packet);
             ha = get_by_con_handle(handle);
+            if (!ha) break;
+
+            auto ev_type = ha->service_ev_arr[ha->service_index - 1];
 
             if (att_status != ATT_ERROR_SUCCESS) {
-                auto ev_type = ha->service_ev_arr[ha->service_index - 1];
                 add_event_to_buffer(ha->conn_id, EventPacket(ev_type, StatusType::ATTStatus, att_status));
                 if (ev_type == EventType::DiscASHAChar) {
                     ha->disconnect();
                     break;
                 }
+            }
+            if (ev_type == EventType::DiscASHAChar
+                && (!gatt_characteristic_supports(&ha->services.asha.rop, ATT_PROPERTY_READ)
+                    || !gatt_characteristic_supports(&ha->services.asha.acp, ATT_PROPERTY_WRITE)
+                    || !gatt_characteristic_supports(&ha->services.asha.asp, ATT_PROPERTY_NOTIFY)
+                    || !gatt_characteristic_supports(&ha->services.asha.vol,
+                                                      ATT_PROPERTY_WRITE_WITHOUT_RESPONSE)
+                    || !gatt_characteristic_supports(&ha->services.asha.psm, ATT_PROPERTY_READ))) {
+                add_event_to_buffer(ha->conn_id,
+                    EventPacket(ev_type, StatusType::PAStatus,
+                                PAError::PAASHACharacteristicNotFound));
+                ha->disconnect();
+                break;
             }
             if (ha->service_index < ha->service_arr.size()) {
                 ha->process_state = DiscoverChars;
@@ -737,13 +819,19 @@ void HearingAid::handle_char_read(PACKET_HANDLER_PARAMS)
             val_len = gatt_event_characteristic_value_query_result_get_value_length(packet);
             val = gatt_event_characteristic_value_query_result_get_value(packet);
             ha = get_by_con_handle(handle);
+            if (!ha) break;
 
             if (val_handle == ha->services.asha.rop.value_handle) {
                 //LOG_INFO("%s: ROP characteristic read", ha->get_side_str());
-                ha->rop.read(val);
-                ha->side_str = ha->rop.side() == Side::Left ? "Left" : "Right";
+                if (ha->rop.read(val, val_len)) {
+                    ha->side_str = ha->rop.side() == Side::Left ? "Left" : "Right";
+                    set_other_side_ptrs();
+                } else {
+                    short_log(ha->conn_id, "Invalid ROP: len=%u ver=%u", val_len,
+                              val_len > 0 ? val[0] : 0u);
+                }
             } else if (val_handle == ha->services.asha.psm.value_handle) {
-                ha->psm = val[0];
+                ha->psm = val_len >= sizeof(ha->psm) ? little_endian_read_16(val, 0) : 0u;
                 //LOG_INFO("%s: PSM characteristic read: %d", ha->get_side_str(), ha->psm);
             } else if (val_handle == ha->services.gap.device_name.value_handle) {
                 //LOG_INFO("%s: Device name read", ha->get_side_str());
@@ -774,6 +862,7 @@ void HearingAid::handle_char_read(PACKET_HANDLER_PARAMS)
             handle = gatt_event_query_complete_get_handle(packet);
             att_status = gatt_event_query_complete_get_att_status(packet);
             ha = get_by_con_handle(handle);
+            if (!ha) break;
 
             auto ev_type = ha->chars_ev_arr[ha->chars_index - 1];
 
@@ -783,6 +872,19 @@ void HearingAid::handle_char_read(PACKET_HANDLER_PARAMS)
                     ha->disconnect();
                     break;
                 }
+            }
+            if (ev_type == EventType::ROPRead && !ha->rop) {
+                add_event_to_buffer(ha->conn_id,
+                    EventPacket(ev_type, StatusType::PAStatus,
+                                PAError::PAInvalidReadOnlyProperties));
+                ha->disconnect();
+                break;
+            }
+            if (ev_type == EventType::PSMRead && ha->psm == 0u) {
+                add_event_to_buffer(ha->conn_id,
+                    EventPacket(ev_type, StatusType::PAStatus, PAError::PAInvalidPSM));
+                ha->disconnect();
+                break;
             }
             EventPacket ev_pkt(ev_type);
             switch (ev_type) {
@@ -845,21 +947,31 @@ void HearingAid::handle_acp_write(PACKET_HANDLER_PARAMS)
         handle = gatt_event_query_complete_get_handle(packet);
         att_status = gatt_event_query_complete_get_att_status(packet);
         ha = get_by_con_handle(handle);
+        if (!ha) return;
 
-        EventType ev_type = ha->audio_state == AudioState::Start ? EventType::ACPStart 
-                                                                 : EventType::ACPStop;
+        EventType ev_type = ha->pending_acp_opcode == ACPOpCode::start
+            ? EventType::ACPStart : EventType::ACPStop;
         if (att_status != ATT_ERROR_SUCCESS) {
             //LOG_ERROR("%s: ACP write failed with status: %s", ha->get_side_str(), att_err_str(att_status));
             add_event_to_buffer(ha->conn_id, EventPacket(ev_type, StatusType::ATTStatus, att_status));
-            ha->audio_state = AudioState::Ready;
+            ha->audio_command_ticks = 0u;
+            if (ha->pending_acp_opcode == ACPOpCode::stop) {
+                // The aid may still be rendering because Stop was not accepted;
+                // only reconnecting can restore a known control-point state.
+                ha->disconnect();
+            } else {
+                ha->audio_state = AudioState::Ready;
+                stop_audio_encoder_if_idle();
+            }
         } else {
             add_event_to_buffer(ha->conn_id, EventPacket(ev_type));
-            if (ha->audio_state == AudioState::Stop) {
+            if (ha->pending_acp_opcode == ACPOpCode::stop) {
                 if (ha->other && ha->other->is_streaming()) {
                     ha->other->send_acp_status(ACPStatus::other_disconnected);
                 }
             }
         }
+        ha->pending_acp_opcode = 0u;
     }
 }
 
@@ -877,6 +989,7 @@ void HearingAid::handle_l2cap_cbm(PACKET_HANDLER_PARAMS)
             handle = l2cap_event_cbm_channel_opened_get_handle(packet);
             bt_status = l2cap_event_cbm_channel_opened_get_status(packet);
             ha = get_by_con_handle(handle);
+            if (!ha) break;
             if (bt_status != ATT_ERROR_SUCCESS) {
                 //LOG_ERROR("%s: Error creating L2CAP cbm connection: %s", ha->get_side_str(), bt_err_str(att_status));
                 add_event_to_buffer(ha->conn_id, EventPacket(EventType::L2CAPCon, StatusType::L2CapStatus, bt_status));
@@ -886,6 +999,19 @@ void HearingAid::handle_l2cap_cbm(PACKET_HANDLER_PARAMS)
                 ha->process_delay_ticks = ha_process_delay_ticks * 3;
             } else {
                 //LOG_INFO("%s: L2CAP cbm connection created", ha->get_side_str());
+                ha->remote_mtu = l2cap_event_cbm_channel_opened_get_remote_mtu(packet);
+                ha->initial_credits = l2cap_cbm_available_credits(ha->cid);
+                ha->credits = ha->initial_credits;
+                if (ha->remote_mtu < asha_l2cap_min_mtu || ha->initial_credits == 0u) {
+                    add_event_to_buffer(ha->conn_id,
+                        EventPacket(EventType::L2CAPCon, StatusType::PAStatus,
+                                    PAError::PAInvalidL2CAPParameters));
+                    ha->disconnect();
+                    break;
+                }
+                if (ha->initial_credits < asha_l2cap_queue_depth) {
+                    short_log(ha->conn_id, "ASHA credits %u (expected 8)", ha->initial_credits);
+                }
                 EventPacket ev_pkt(EventType::L2CAPCon);
                 ev_pkt.data.cid = ha->cid;
                 add_event_to_buffer(ha->conn_id, ev_pkt);
@@ -895,12 +1021,28 @@ void HearingAid::handle_l2cap_cbm(PACKET_HANDLER_PARAMS)
         case L2CAP_EVENT_CAN_SEND_NOW:
             cid = l2cap_event_can_send_now_get_local_cid(packet);
             ha = get_by_cid(cid);
-            l2cap_send(cid, ha->audio_data, ASHA_SDU_SIZE_BYTES);
+            if (!ha || !ha->is_audio_busy()) break;
+            bt_status = l2cap_send(cid, ha->tx_sdu.data(), ASHA_SDU_SIZE_BYTES);
+            if (bt_status == ERROR_CODE_SUCCESS) {
+                ha->curr_read_index = ha->tx_read_index + 1u;
+            } else {
+                add_event_to_buffer(ha->conn_id,
+                    EventPacket(EventType::L2CAPCon, StatusType::BtstackStatus, bt_status));
+                ha->unset_audio_busy();
+            }
             break;
         case L2CAP_EVENT_PACKET_SENT:
             cid = l2cap_event_packet_sent_get_local_cid(packet);
             ha = get_by_cid(cid);
-            ha->unset_audio_busy();
+            if (ha) ha->unset_audio_busy();
+            break;
+        case L2CAP_EVENT_CHANNEL_CLOSED:
+            cid = l2cap_event_channel_closed_get_local_cid(packet);
+            ha = get_by_cid(cid);
+            if (ha && ha->is_connected()) {
+                short_log(ha->conn_id, "%s", "ASHA L2CAP channel closed");
+                ha->disconnect();
+            }
             break;
         default:
             break;
@@ -964,6 +1106,7 @@ void HearingAid::handle_gatt_notification(PACKET_HANDLER_PARAMS)
         handle = gatt_event_notification_get_handle(packet);
         val_handle = gatt_event_notification_get_value_handle(packet);
         ha = get_by_con_handle(handle);
+        if (!ha || gatt_event_notification_get_value_length(packet) < 1u) return;
         if (val_handle == ha->services.asha.asp.value_handle) {
             asp_status = (int8_t)gatt_event_notification_get_value(packet)[0];
             EventPacket err_ev_pkt(EventType::ASPError);
@@ -975,28 +1118,47 @@ void HearingAid::handle_gatt_notification(PACKET_HANDLER_PARAMS)
                         //LOG_INFO("%s: Audio start OK", ha->get_side_str());
                         add_event_to_buffer(ha->conn_id, EventPacket(EventType::ASPStart));
                         ha->audio_state = AudioState::Streaming;
-                        asha_audio_set_encoding_enabled(true);
+                        ha->audio_command_ticks = 0u;
                         if (ha->other && ha->other->is_streaming()) {
                             ha->other->send_acp_status(ACPStatus::other_connected);
                         }
                         ha->first_audio_send = true;
+                        maybe_start_audio_encoder();
                     } else if (ha->audio_state == AudioState::Stop) {
                         //LOG_INFO("%s: Audio stop OK", ha->get_side_str());
                         add_event_to_buffer(ha->conn_id, EventPacket(EventType::ASPStop));
 
                         ha->stop_request_from_other = false;
                         ha->audio_state = AudioState::Ready;
+                        ha->audio_command_ticks = 0u;
+                        stop_audio_encoder_if_idle();
                     }
                     break;
                 case ASPStatus::unkown_command:
                 case ASPStatus::illegal_params:
                     add_event_to_buffer(ha->conn_id, err_ev_pkt);
+                    if (ha->audio_state == AudioState::Stop) {
+                        ha->audio_command_ticks = 0u;
+                        ha->disconnect();
+                    } else if (ha->audio_state == AudioState::Start) {
+                        ha->audio_state = AudioState::Ready;
+                        ha->audio_command_ticks = 0u;
+                        stop_audio_encoder_if_idle();
+                    }
                     break;
                 default:
                     //LOG_ERROR("%s: ASP: Unknown command", ha->get_side_str());
                     //LOG_ERROR("%s: ASP: Illegal parameters", ha->get_side_str());
                     //LOG_ERROR("%s: ASP: Unknown status: %d", ha->get_side_str(), asp_status);
                     add_event_to_buffer(ha->conn_id, err_ev_pkt);
+                    if (ha->audio_state == AudioState::Stop) {
+                        ha->audio_command_ticks = 0u;
+                        ha->disconnect();
+                    } else if (ha->audio_state == AudioState::Start) {
+                        ha->audio_state = AudioState::Ready;
+                        ha->audio_command_ticks = 0u;
+                        stop_audio_encoder_if_idle();
+                    }
                     break;
             }
         } else if (val_handle == ha->services.mfi.battery.value_handle) {
@@ -1013,9 +1175,9 @@ bool HearingAid::process_audio()
     using namespace comm;
 #ifdef PICO_ASHA_ENC_STATS
     bool send_enc_times = false;
+    uint32_t enc_stats_index = 0u;
 #endif
 
-    uint32_t w_index = asha_audio_get_write_index();
     int16_t usb_vol_l = asha_audio_get_curr_usb_vol(AshaAudioSide::AudioLeft);
     int16_t usb_vol_r = asha_audio_get_curr_usb_vol(AshaAudioSide::AudioRight);
 
@@ -1040,41 +1202,22 @@ bool HearingAid::process_audio()
         ha->credits = l2cap_cbm_available_credits(ha->cid);
         switch (ha->audio_state) {
             case AudioState::Ready:
-                // After a zero-credits stop, wait up to the cooldown window for
-                // credits to fully replenish before restarting; starting at low
-                // credit counts immediately re-drains and produces audible
-                // cycling. Falls through on timeout so we don't deadlock on aids
-                // that never grant back to the ceiling.
-                if (ha->zero_credits_cooldown > 0) {
-                    --ha->zero_credits_cooldown;
-                    if (ha->credits < 8) {
-                        break;
-                    }
-                }
                 if ((!ha->other || !ha->other->stop_request_from_other)
                     && audio_streaming_enabled
-                    && pcm_is_streaming
-                    && ha->credits >= 4) {
-                        // Sync curr_vol from the host volume so the start payload
-                        // reflects what the host is currently asking for. Without
-                        // this, curr_vol's class default of -128 (the ASHA mute
-                        // sentinel) gets baked into the first start after boot and
-                        // some aids latch onto it, ignoring later volume writes.
-                        ha->curr_vol = ha->rop.side() == Side::Left ? vol_l : vol_r;
-                        ha->set_audio_busy();
-                        ha->send_acp_start();
-                        ha->ready_stuck_ticks = 0;
-                } else if (audio_streaming_enabled && pcm_is_streaming && ha->credits < 4) {
-                    // Aid wedged with credits stuck below the start gate. Only a
-                    // fresh L2CAP CoC channel resets the credit window, so force
-                    // a reconnect once the stuck timeout elapses.
-                    if (++ha->ready_stuck_ticks >= ready_stuck_timeout_ticks) {
-                        ha->ready_stuck_ticks = 0;
-                        short_log(ha->conn_id, "%s", "Ready state stuck, reconnecting");
-                        ha->disconnect();
-                    }
-                } else {
-                    ha->ready_stuck_ticks = 0;
+                    && pcm_is_streaming) {
+                    // AOSP starts the control procedure once the CoC is ready and
+                    // relies on flow-control credits for the data path. A compliant
+                    // peripheral grants eight initial credits, but Start itself is
+                    // not gated on an arbitrary lower watermark.
+                    ha->curr_vol = ha->rop.side() == Side::Left ? vol_l : vol_r;
+                    ha->send_acp_start();
+                }
+                break;
+            case AudioState::Start:
+            case AudioState::Stop:
+                if (++ha->audio_command_ticks >= audio_command_timeout_ticks) {
+                    short_log(ha->conn_id, "%s", "ASHA control timeout, reconnecting");
+                    ha->disconnect();
                 }
                 break;
             case AudioState::Streaming:
@@ -1086,6 +1229,8 @@ bool HearingAid::process_audio()
                     ha->send_acp_stop();
                 } else if (ha->stop_request_from_other) {
                     short_log(ha->conn_id, "%s", "Stop requested from other");
+                    // Both sides restart from one new encoder/sequence epoch.
+                    asha_audio_set_encoding_enabled(false);
                     ha->send_acp_stop();
                 } else {
                     // Send volume update if volume has changed
@@ -1095,6 +1240,11 @@ bool HearingAid::process_audio()
                         // short_log(ha->conn_id, "USB L:%d R:%d", (int)usb_vol_l, (int)usb_vol_r);
                         ha->send_volume(ha->curr_vol);
                     }
+                    if (!asha_audio_stream_ready()) {
+                        break;
+                    }
+
+                    uint32_t w_index = asha_audio_get_write_index();
                     if (w_index == 0) {
                         break;
                     }
@@ -1102,41 +1252,52 @@ bool HearingAid::process_audio()
                         ha->curr_read_index = w_index - 1;
                         ha->first_audio_send = false;
                     }
-                    if (ha->curr_read_index < w_index) {
-                        if (ha->credits == 0) {
-                            short_log(ha->conn_id, "%s", "Zero credits");
-                            // Wait long enough for a slow aid to replenish before
-                            // attempting to restart; see the Ready branch above.
-                            ha->zero_credits_cooldown = 500;
-                            if (ha->other && ha->other->is_streaming()) {
-                                ha->other->stop_request_from_other = true;
-                            }
-                            ha->send_acp_stop();
-                            break;
-                        }
-                        // Restart stream if starting to fall behind
-                        if (w_index - ha->curr_read_index >= 2) {
-                            short_log(ha->conn_id, "%s", "Stream fell behind: restart");
-                            if (ha->other && ha->other->is_streaming()) {
-                                ha->other->stop_request_from_other = true;
-                            }
-                            ha->send_acp_stop();
-                            break;
-                        }
-
-                        ha->set_audio_busy();
-
-                        enum AshaAudioSide audio_side = ha->rop.side() == Side::Left ? AshaAudioSide::AudioLeft
-                                                                                     : AshaAudioSide::AudioRight;
-                        ha->audio_data = asha_audio_get_encoded_at_index(audio_side, ha->curr_read_index);
-                        ++(ha->curr_read_index);
-                        l2cap_request_can_send_now_event(ha->cid);
-                        enable_process_delay = true;
-#ifdef PICO_ASHA_ENC_STATS
-                        send_enc_times = true;
-#endif
+                    uint32_t backlog = w_index - ha->curr_read_index;
+                    if (backlog > asha_l2cap_queue_depth) {
+                        // Equivalent to AOSP's L2CA_FlushChannel(ALL): discard
+                        // stale local packets, retain the newest complete SDU and
+                        // keep the ACP stream alive.
+                        short_log(ha->conn_id, "ASHA queue flush: %u", backlog);
+                        ha->curr_read_index = w_index - 1u;
                     }
+                    if (ha->curr_read_index == w_index || ha->credits == 0u) {
+                        break;
+                    }
+
+                    enum AshaAudioSide audio_side = ha->rop.side() == Side::Left
+                        ? AshaAudioSide::AudioLeft : AshaAudioSide::AudioRight;
+                    if (!asha_audio_copy_encoded_at_index(audio_side,
+                                                          ha->curr_read_index,
+                                                          ha->tx_sdu.data(),
+                                                          ha->tx_sdu.size())) {
+                        // This absolute index was already overwritten. Re-snapshot
+                        // the head and retry from the newest packet on the next
+                        // tick; tx_sdu remains stable until PACKET_SENT.
+                        w_index = asha_audio_get_write_index();
+                        if (w_index > 0u) ha->curr_read_index = w_index - 1u;
+                        break;
+                    }
+
+                    ha->tx_read_index = ha->curr_read_index;
+                    ha->set_audio_busy();
+                    uint8_t request_status = l2cap_request_can_send_now_event(ha->cid);
+                    if (request_status != ERROR_CODE_SUCCESS) {
+                        ha->unset_audio_busy();
+                        add_event_to_buffer(ha->conn_id,
+                            EventPacket(EventType::L2CAPCon,
+                                        StatusType::BtstackStatus,
+                                        request_status));
+                        break;
+                    }
+                    enable_process_delay = true;
+#ifdef PICO_ASHA_ENC_STATS
+                    send_enc_times = true;
+                    enc_stats_index = ha->tx_read_index;
+#endif
                 }
+                break;
+            case AudioState::Streaming | AudioState::AudioBusy:
+                // The per-device tx_sdu is owned by BTstack until PACKET_SENT.
                 break;
             default:
                 break;
@@ -1144,13 +1305,15 @@ bool HearingAid::process_audio()
     }
 #ifdef PICO_ASHA_ENC_STATS
     if (send_enc_times) {
-        auto enc_times = asha_audio_get_encoding_time_at_index(w_index == 0 ? 0 : w_index - 1);
-        EventPacket pkt1(EventType::G722EncTimings);
-        EventPacket pkt2(EventType::G722EncTimings);
-        memcpy(pkt1.data.encode_timings, enc_times, 20);
-        memcpy(pkt2.data.encode_timings, enc_times + 10, 20);
-        add_event_to_buffer(unset_conn_id, pkt1);
-        add_event_to_buffer(unset_conn_id, pkt2);
+        int16_t enc_times[20];
+        if (asha_audio_copy_encoding_times_at_index(enc_stats_index, enc_times, 20u)) {
+            EventPacket pkt1(EventType::G722EncTimings);
+            EventPacket pkt2(EventType::G722EncTimings);
+            memcpy(pkt1.data.encode_timings, enc_times, 20);
+            memcpy(pkt2.data.encode_timings, enc_times + 10, 20);
+            add_event_to_buffer(unset_conn_id, pkt1);
+            add_event_to_buffer(unset_conn_id, pkt2);
+        }
     }
 #endif
     return enable_process_delay;
@@ -1200,27 +1363,19 @@ HearingAid* HearingAid::get_by_cached_addr(bd_addr_t addr)
 
 bool HearingAid::full_set_connected()
 {
-    bool have_left = false;
-    bool have_right = false;
     for (auto ha : hearing_aids) {
-        if (ha->is_connected() && ha->rop) {
-            if (ha->rop.mode() == Mode::Mono) {
-                have_left = true;
-                have_right = true;
-                break;
-            } else if (ha->rop.side() == Side::Left) {
-                have_left = true;
-            } else if (ha->rop.side() == Side::Right) {
-                have_right = true;
-            }
+        if (ha->is_connected() && ha->rop && ha->rop.mode() == Mode::Mono) {
+            return true;
         }
     }
-    return have_left && have_right;
+    return hearing_aids[0]->is_connected() && hearing_aids[1]->is_connected()
+        && hearing_aids[0]->rop.same_binaural_set(hearing_aids[1]->rop);
 }
 
 void HearingAid::set_other_side_ptrs()
 {
-    if (hearing_aids[0]->is_connected() && hearing_aids[1]->is_connected()) {
+    if (hearing_aids[0]->is_connected() && hearing_aids[1]->is_connected()
+        && hearing_aids[0]->rop.same_binaural_set(hearing_aids[1]->rop)) {
         hearing_aids[0]->other = hearing_aids[1];
         hearing_aids[1]->other = hearing_aids[0];
     } else {
@@ -1246,6 +1401,11 @@ bool HearingAid::is_streaming()
             audio_state == (AudioState::Streaming | AudioState::AudioBusy);
 }
 
+bool HearingAid::is_audio_busy()
+{
+    return (audio_state & AudioState::AudioBusy) != 0u;
+}
+
 void HearingAid::set_process_busy()
 {
     process_state |= ProcessState::ProcessBusy;
@@ -1266,9 +1426,22 @@ void HearingAid::unset_audio_busy()
     audio_state &= ~AudioState::AudioBusy;
 }
 
-void HearingAid::set_data_langth()
+void HearingAid::set_data_length()
 {
     hci_send_cmd(&hci_le_set_data_length, conn_handle, pdu_len, max_tx_time);
+}
+
+uint8_t HearingAid::request_connection_parameters()
+{
+    int status = gap_update_connection_parameters(conn_handle,
+                                                  asha_conn_interval,
+                                                  asha_conn_interval,
+                                                  asha_conn_latency,
+                                                  asha_supervision_timeout);
+    if (status == ERROR_CODE_SUCCESS) {
+        connection_update_pending = true;
+    }
+    return static_cast<uint8_t>(status);
 }
 
 void HearingAid::send_acp_start()
@@ -1276,11 +1449,15 @@ void HearingAid::send_acp_start()
     using namespace comm;
 
     audio_state = AudioState::Start;
+    audio_command_ticks = 0u;
+    pending_acp_opcode = ACPOpCode::start;
     acp_cmd_packet[0] = ACPOpCode::start; // Opcode
     acp_cmd_packet[1] = 1u; // G.722 codec at 16KHz
     acp_cmd_packet[2] = 0u; // Unkown audio type
     acp_cmd_packet[3] = (uint8_t)curr_vol; // Volume
-    acp_cmd_packet[4] = (other && other->is_streaming()) ? 1 : 0; // Otherstate
+    acp_cmd_packet[4] = (other && other->is_connected()
+                         && audio_streaming_enabled
+                         && asha_audio_get_pcm_streaming_enabled()) ? 1u : 0u;
 
     uint8_t res = gatt_client_write_value_of_characteristic(&HearingAid::handle_acp_write, 
                                                             conn_handle, 
@@ -1291,6 +1468,7 @@ void HearingAid::send_acp_start()
         //LOG_ERROR("%s: ACP Write: Start error %s", get_side_str(), bt_err_str(res));
         add_event_to_buffer(conn_id, EventPacket(EventType::ACPStart, StatusType::BtstackStatus, res));
         audio_state = AudioState::Ready;
+        pending_acp_opcode = 0u;
     }
 }
 
@@ -1299,6 +1477,8 @@ void HearingAid::send_acp_stop()
     using namespace comm;
 
     audio_state = AudioState::Stop;
+    audio_command_ticks = 0u;
+    pending_acp_opcode = ACPOpCode::stop;
     acp_cmd_packet[0] = ACPOpCode::stop;
     uint8_t res = gatt_client_write_value_of_characteristic(&HearingAid::handle_acp_write,
                                                             conn_handle,
@@ -1308,6 +1488,7 @@ void HearingAid::send_acp_stop()
     if (res != ERROR_CODE_SUCCESS) {
         //LOG_ERROR("%s: ACP Write: Stop error %s", get_side_str(), bt_err_str(res));
         add_event_to_buffer(conn_id, EventPacket(EventType::ACPStop, StatusType::BtstackStatus, res));
+        pending_acp_opcode = 0u;
         disconnect();
     }
 }
@@ -1365,11 +1546,22 @@ void HearingAid::reset()
     other = nullptr;
     psm = 0;
     credits = 0;
+    initial_credits = 0;
+    remote_mtu = 0;
+    connection_interval = 0;
+    connection_latency = 0;
+    connection_update_pending = false;
     paired_and_bonded = false;
     process_delay_ticks = 0;
     error_count = 0;
     service_index = 0;
     chars_index = cached_chars_index;
+    curr_read_index = 0u;
+    tx_read_index = 0u;
+    first_audio_send = false;
+    audio_command_ticks = 0u;
+    stop_request_from_other = false;
+    pending_acp_opcode = 0u;
     
     if (!cached) {
         memset(addr, 0U, sizeof(bd_addr_t));
@@ -1383,6 +1575,37 @@ void HearingAid::reset()
         services = {};
         chars_index = 0;
     }
+}
+
+void HearingAid::maybe_start_audio_encoder()
+{
+    if (asha_audio_get_encoding_enabled()) return;
+
+    bool have_streaming_device = false;
+    for (auto ha : hearing_aids) {
+        if (ha->process_state != ProcessState::Audio) continue;
+        if (ha->audio_state == AudioState::Start) return;
+        have_streaming_device |= ha->is_streaming();
+    }
+
+    if (have_streaming_device) {
+        asha_audio_set_encode_mono(!(hearing_aids[0]->is_streaming()
+                                     && hearing_aids[1]->is_streaming()));
+        asha_audio_start_stream();
+    }
+}
+
+void HearingAid::stop_audio_encoder_if_idle()
+{
+    for (auto ha : hearing_aids) {
+        if (ha->is_streaming()) {
+            // A peer may have rejected Start while this device already
+            // acknowledged it. Let the surviving stream begin its epoch.
+            maybe_start_audio_encoder();
+            return;
+        }
+    }
+    asha_audio_set_encoding_enabled(false);
 }
 
 const char* HearingAid::get_side_str()

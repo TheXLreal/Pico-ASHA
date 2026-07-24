@@ -15,7 +15,7 @@ namespace asha
 {
 /* Connection parameters for ASHA
    Note, connection interval is in units of 1.25ms */
-constexpr uint16_t asha_conn_interval = 20 / 1.25f;
+constexpr uint16_t asha_conn_interval = 0x0010;
 
 constexpr uint16_t asha_conn_latency  = 10;
 
@@ -309,17 +309,32 @@ static void hci_event_handler(PACKET_HANDLER_PARAMS)
                 hci_con_handle_t handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
                 bd_addr_t addr = {};
                 gap_subevent_le_connection_complete_get_peer_address(packet, addr);
-                HearingAid::on_connected(addr, handle);
+                uint16_t interval = gap_subevent_le_connection_complete_get_conn_interval(packet);
+                uint16_t latency = gap_subevent_le_connection_complete_get_conn_latency(packet);
+                HearingAid::on_connected(addr, handle, interval, latency);
             }
             break;
         case HCI_EVENT_LE_META:
-            if (hci_event_le_meta_get_subevent_code(packet) == HCI_SUBEVENT_LE_DATA_LENGTH_CHANGE) {
-                hci_con_handle_t handle = hci_subevent_le_data_length_change_get_connection_handle(packet);
-                uint16_t rx_octets = hci_subevent_le_data_length_change_get_max_rx_octets(packet);
-                uint16_t rx_time = hci_subevent_le_data_length_change_get_max_rx_time(packet);
-                uint16_t tx_octets = hci_subevent_le_data_length_change_get_max_tx_octets(packet);
-                uint16_t tx_time = hci_subevent_le_data_length_change_get_max_tx_time(packet);
-                HearingAid::on_data_len_set(handle, rx_octets, rx_time, tx_octets, tx_time);
+            switch (hci_event_le_meta_get_subevent_code(packet)) {
+                case HCI_SUBEVENT_LE_DATA_LENGTH_CHANGE: {
+                    hci_con_handle_t handle = hci_subevent_le_data_length_change_get_connection_handle(packet);
+                    uint16_t rx_octets = hci_subevent_le_data_length_change_get_max_rx_octets(packet);
+                    uint16_t rx_time = hci_subevent_le_data_length_change_get_max_rx_time(packet);
+                    uint16_t tx_octets = hci_subevent_le_data_length_change_get_max_tx_octets(packet);
+                    uint16_t tx_time = hci_subevent_le_data_length_change_get_max_tx_time(packet);
+                    HearingAid::on_data_len_set(handle, rx_octets, rx_time, tx_octets, tx_time);
+                    break;
+                }
+                case HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE: {
+                    hci_con_handle_t handle = hci_subevent_le_connection_update_complete_get_connection_handle(packet);
+                    uint8_t status = hci_subevent_le_connection_update_complete_get_status(packet);
+                    uint16_t interval = hci_subevent_le_connection_update_complete_get_conn_interval(packet);
+                    uint16_t latency = hci_subevent_le_connection_update_complete_get_conn_latency(packet);
+                    HearingAid::on_connection_update(handle, status, interval, latency);
+                    break;
+                }
+                default:
+                    break;
             }
             break;
         case HCI_EVENT_DISCONNECTION_COMPLETE:

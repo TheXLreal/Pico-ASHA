@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -8,6 +9,13 @@ extern "C" {
 
 #define ASHA_G722_RING_SIZE 8u
 #define ASHA_G722_RING_SIZE_MASK 7u
+
+// Android ASHA is designed around an elastic queue of at most eight audio
+// packets. Keep this a power of two: the producer and Bluetooth consumer run
+// on different cores and use the absolute packet index to address the ring.
+#if (ASHA_G722_RING_SIZE == 0u) || ((ASHA_G722_RING_SIZE & (ASHA_G722_RING_SIZE - 1u)) != 0u)
+#error "ASHA_G722_RING_SIZE must be a non-zero power of two"
+#endif
 
 // Number of samples per ms
 #define ASHA_PCM_PACKET_SIZE 16u
@@ -68,17 +76,39 @@ void asha_audio_init();
 uint32_t asha_audio_get_write_index();
 
 /**
+ * Begin a new ASHA stream epoch.
+ *
+ * The audio producer resets the G.722 state, decimators, packet sequence and
+ * ring on its own core before publishing the first packet. This mirrors the
+ * Android ASHA Start procedure without racing the USB audio callback.
+ */
+void asha_audio_start_stream();
+
+/**
+ * True after the producer has completed the stream reset.
+ */
+bool asha_audio_stream_ready();
+
+/**
  * Encode 1ms of 16-bit 16kHz PCM stereo audio to G.722
  */
 void asha_audio_encode_1ms_pcm(struct PCMStereoSample* samples, uint16_t count);
 
 /**
- * Get encoded audio for side at index
+ * Copy a committed encoded SDU for side at an absolute ring index.
+ *
+ * Returns false when the packet has already been overwritten or is currently
+ * being replaced. The destination must hold ASHA_SDU_SIZE_BYTES bytes.
  */
-uint8_t* asha_audio_get_encoded_at_index(enum AshaAudioSide side, uint32_t index);
+bool asha_audio_copy_encoded_at_index(enum AshaAudioSide side,
+                                      uint32_t index,
+                                      uint8_t* destination,
+                                      uint16_t destination_size);
 
 #ifdef PICO_ASHA_ENC_STATS
-int16_t* asha_audio_get_encoding_time_at_index(uint32_t index);
+bool asha_audio_copy_encoding_times_at_index(uint32_t index,
+                                             int16_t* destination,
+                                             uint16_t count);
 #endif
 
 /**

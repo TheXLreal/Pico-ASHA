@@ -632,6 +632,18 @@ bool PicoAshaComm::checkError(const asha::comm::HeaderPacket header, const asha:
         case PAError::PAASHAServiceNotFound:
             status = "PA_ASHA_SERVICE_NOT_FOUND";
             break;
+        case PAError::PAASHACharacteristicNotFound:
+            status = "PA_ASHA_CHARACTERISTIC_NOT_FOUND";
+            break;
+        case PAError::PAInvalidReadOnlyProperties:
+            status = "PA_INVALID_READ_ONLY_PROPERTIES";
+            break;
+        case PAError::PAInvalidPSM:
+            status = "PA_INVALID_PSM";
+            break;
+        case PAError::PAInvalidL2CAPParameters:
+            status = "PA_INVALID_L2CAP_PARAMETERS";
+            break;
         case PAError::PARuntimeSettingsErr:
             status = "PA_RUNTIME_SETTINGS_ERR";
             break;

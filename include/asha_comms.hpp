@@ -48,6 +48,10 @@ namespace comm
         PARuntimeSettingsErr,
         PAMaxConnected,
         PAASHAServiceNotFound,
+        PAASHACharacteristicNotFound,
+        PAInvalidReadOnlyProperties,
+        PAInvalidPSM,
+        PAInvalidL2CAPParameters,
     };
 
     enum class EventType : uint8_t
@@ -63,7 +67,7 @@ namespace comm
         DiscASHAChar,
         // Data is 17 byte ROP
         ROPRead,
-        // Data is 1 byte PSM
+        // Data is a 16-bit little-endian PSM
         PSMRead,
         DiscGAPChar,
         // Data is up to 32 byte null terminated string
@@ -201,7 +205,7 @@ namespace comm
                 uint8_t addr[6];
                 uint16_t hci_handle;
             } conn_info;
-            uint8_t psm;
+            uint16_t psm;
             int8_t asp_not;
             int8_t volume;
             uint16_t cid;

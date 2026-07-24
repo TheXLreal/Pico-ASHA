@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <span>
 
 #include <etl/string.h>
@@ -15,11 +16,12 @@ namespace asha
 
 constexpr int ha_process_delay_ticks = 500;
 
-// How long the audio loop is allowed to sit in Ready with the host
-// actively delivering audio but L2CAP credits stuck below the start
-// gate, before forcing a BLE reconnect to recover. Audio loop ticks
-// at 1 ms, so this is 3 seconds.
-constexpr uint32_t ready_stuck_timeout_ticks = 3000;
+// Android ASHA uses an eight-packet elastic CoC queue. A control-point command
+// is allowed three seconds to complete before the link is recovered.
+constexpr uint16_t asha_l2cap_queue_depth = ASHA_G722_RING_SIZE;
+constexpr uint16_t asha_l2cap_min_mtu = 167u;
+constexpr uint16_t asha_l2cap_local_mtu = 512u;
+constexpr uint32_t audio_command_timeout_ticks = 3000;
 
 enum class Side  {Left = 0, Right = 1};
 enum class Mode  {Mono = 0, Binaural = 1};
@@ -27,16 +29,29 @@ enum class Codec {G722_16, G722_24};
 
 struct ROP
 {
+    static constexpr size_t size = 17;
     uint8_t raw_data[17] = {};
 
-    void read(const uint8_t* data) { memcpy(raw_data, data, sizeof(raw_data)); }
-    Side side() { return (raw_data[1] & 0b00000001) ? Side::Right : Side::Left; }
-    Mode mode() { return (raw_data[1] & 0b00000010) ? Mode::Binaural : Mode::Mono; }
-    uint16_t mfg_id() { return little_endian_read_16(raw_data, 2); }
-    std::span<uint8_t, 6> unique_id() { return std::span<uint8_t, 6>(raw_data + 4, 6); }
-    bool le_coc_supported() { return (raw_data[10] & 0b00000001); }
-    uint16_t render_delay() { return little_endian_read_16(raw_data, 11); }
-    bool supports_codec(Codec c) {
+    bool read(const uint8_t* data, size_t data_size) {
+        if (data == nullptr || data_size < size) return false;
+        memcpy(raw_data, data, size);
+        return valid();
+    }
+    uint8_t version() const { return raw_data[0]; }
+    Side side() const { return (raw_data[1] & 0b00000001) ? Side::Right : Side::Left; }
+    Mode mode() const { return (raw_data[1] & 0b00000010) ? Mode::Binaural : Mode::Mono; }
+    bool csis_supported() const { return raw_data[1] & 0b00000100; }
+    uint16_t mfg_id() const { return little_endian_read_16(raw_data, 2); }
+    std::span<const uint8_t, 6> unique_id() const { return std::span<const uint8_t, 6>(raw_data + 4, 6); }
+    uint64_t hi_sync_id() const {
+        uint64_t id = 0;
+        for (size_t i = 0; i < 8; ++i) id |= static_cast<uint64_t>(raw_data[2 + i]) << (i * 8);
+        return id;
+    }
+    bool le_coc_supported() const { return raw_data[10] & 0b00000001; }
+    uint16_t render_delay() const { return little_endian_read_16(raw_data, 11); }
+    uint16_t preparation_delay() const { return little_endian_read_16(raw_data, 13); }
+    bool supports_codec(Codec c) const {
         uint16_t codecs = little_endian_read_16(raw_data, 15);
         switch (c) {
             case Codec::G722_16:
@@ -44,9 +59,21 @@ struct ROP
             case Codec::G722_24:
                 return codecs & 0b0000000000000100;
         }
+        return false;
     }
 
-    explicit operator bool() const { return raw_data[0]; } 
+    bool same_binaural_set(const ROP& other) const {
+        return valid() && other.valid()
+            && mode() == Mode::Binaural && other.mode() == Mode::Binaural
+            && side() != other.side()
+            && hi_sync_id() != 0 && hi_sync_id() == other.hi_sync_id();
+    }
+
+    bool valid() const {
+        return version() == 0x01 && le_coc_supported() && supports_codec(Codec::G722_16);
+    }
+
+    explicit operator bool() const { return valid(); }
 };
 
 struct HearingAid
@@ -101,7 +128,7 @@ struct HearingAid
 
     /* ASHA vars */
 
-    uint8_t psm = 0U;
+    uint16_t psm = 0U;
     ROP rop = {};
 
     const char* side_str = "Unknown";
@@ -132,9 +159,12 @@ struct HearingAid
     static void start_scan();
     static void on_ad_report(const AdvertisingReport& report);
     static void connect(const bd_addr_t addr, bd_addr_type_t addr_type);
-    static void on_connected(bd_addr_t addr, hci_con_handle_t handle);
+    static void on_connected(bd_addr_t addr, hci_con_handle_t handle,
+                             uint16_t conn_interval, uint16_t conn_latency);
     static void on_disconnected(hci_con_handle_t handle, uint8_t status, uint8_t reason);
     static void on_data_len_set(hci_con_handle_t handle, uint16_t rx_octets, uint16_t rx_time, uint16_t tx_octets, uint16_t tx_time);
+    static void on_connection_update(hci_con_handle_t handle, uint8_t status,
+                                     uint16_t conn_interval, uint16_t conn_latency);
     static void delete_pair();
     static void delete_pair(uint16_t conn_id);
     static void handle_sm(PACKET_HANDLER_PARAMS);
@@ -209,12 +239,17 @@ private:
     /* L2CAP credit management */
 
     uint16_t credits = 0;
-    uint32_t zero_credits_cooldown = 0;
-    uint32_t ready_stuck_ticks = 0;
+    uint16_t initial_credits = 0;
+    uint16_t remote_mtu = 0;
     int8_t curr_vol = -128;
+
+    uint16_t connection_interval = 0;
+    uint16_t connection_latency = 0;
+    bool connection_update_pending = false;
 
     // Array to store current AudioControlPoint command packet
     std::array<uint8_t, 5> acp_cmd_packet = {};
+    uint8_t pending_acp_opcode = 0u;
 
     inline static std::array<HearingAid*, 2> hearing_aids;
 
@@ -222,12 +257,14 @@ private:
     int error_count = 0;
 
     uint32_t curr_read_index = 0U;
+    uint32_t tx_read_index = 0U;
     bool first_audio_send = false;
-    uint8_t* audio_data = nullptr;
+    uint32_t audio_command_ticks = 0U;
+    std::array<uint8_t, ASHA_SDU_SIZE_BYTES> tx_sdu = {};
 
     bool stop_request_from_other = false;
 
-    std::array<uint8_t, ASHA_SDU_SIZE_BYTES> recv_buff = {};
+    std::array<uint8_t, asha_l2cap_local_mtu> recv_buff = {};
 
     uint16_t conn_id = comm::unset_conn_id;
 
@@ -247,11 +284,13 @@ private:
     void assign_next_conn_id();
     bool is_connected();
     bool is_streaming();
+    bool is_audio_busy();
     void set_process_busy();
     void unset_process_busy();
     void set_audio_busy();
     void unset_audio_busy();
-    void set_data_langth();
+    void set_data_length();
+    uint8_t request_connection_parameters();
     void send_acp_start();
     void send_acp_stop();
     void send_acp_status(uint8_t status);
@@ -259,6 +298,9 @@ private:
     void disconnect();
     void reset();
     const char* get_side_str();
+
+    static void maybe_start_audio_encoder();
+    static void stop_audio_encoder_if_idle();
 };
 
 } // namespace asha

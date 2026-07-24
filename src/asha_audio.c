@@ -1,3 +1,5 @@
+#include <limits.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -29,11 +31,17 @@ struct AshaAudioEncBuffer {
 #ifdef PICO_ASHA_ENC_STATS
     int16_t encode_times[20];
 #endif
+    // UINT_FAST32_MAX marks a slot before its first publication. The lock makes
+    // the payload itself data-race-free while the producer wraps the ring.
+    atomic_uint_fast32_t published_index;
+    atomic_bool locked;
 };
 
 static atomic_bool pcm_streaming;
 static atomic_bool encode_audio;
 static atomic_bool encode_mono;
+static atomic_bool reset_stream_requested;
+static atomic_bool stream_ready;
 
 static atomic_uint_fast32_t write_index;
 
@@ -45,6 +53,7 @@ g722_encode_state_t enc_state_l;
 g722_encode_state_t enc_state_r;
 
 static struct AshaAudioEncBuffer enc_ring_buff[ASHA_G722_RING_SIZE];
+static struct AshaAudioEncBuffer enc_work_buff;
 static unsigned int g_offset;
 static unsigned int enc_time_index;
 static uint8_t seq_num;
@@ -60,6 +69,33 @@ static inline uint32_t ring_buff_index(const uint32_t index)
     return index & ASHA_G722_RING_SIZE_MASK;
 }
 
+static void lock_ring_slot(struct AshaAudioEncBuffer* slot)
+{
+    while (atomic_exchange(&slot->locked, true)) {}
+}
+
+static void unlock_ring_slot(struct AshaAudioEncBuffer* slot)
+{
+    atomic_store(&slot->locked, false);
+}
+
+static void initialize_ring()
+{
+    for (uint32_t i = 0; i < ASHA_G722_RING_SIZE; ++i) {
+        atomic_init(&enc_ring_buff[i].locked, false);
+        atomic_init(&enc_ring_buff[i].published_index, UINT_FAST32_MAX);
+    }
+}
+
+static void invalidate_ring()
+{
+    for (uint32_t i = 0; i < ASHA_G722_RING_SIZE; ++i) {
+        lock_ring_slot(&enc_ring_buff[i]);
+        atomic_store(&enc_ring_buff[i].published_index, UINT_FAST32_MAX);
+        unlock_ring_slot(&enc_ring_buff[i]);
+    }
+}
+
 static void reset_encoders()
 {
     g722_encode_init(&enc_state_l, 64000, G722_PACKED);
@@ -72,13 +108,34 @@ static void reset_decimators()
     arm_fir_decimate_init_q15(&fir_s_r, ASHA_NUM_TAPS, 48000/16000, fir_c, p_state_r, ASHA_BLOCK_SIZE);
 }
 
+static void reset_stream_state()
+{
+    invalidate_ring();
+    memset(enc_work_buff.l, 0, sizeof(enc_work_buff.l));
+    memset(enc_work_buff.r, 0, sizeof(enc_work_buff.r));
+#ifdef PICO_ASHA_ENC_STATS
+    memset(enc_work_buff.encode_times, 0, sizeof(enc_work_buff.encode_times));
+#endif
+    g_offset = 1u;
+    enc_time_index = 0u;
+    seq_num = 0u;
+    atomic_store(&write_index, 0u);
+    reset_encoders();
+    reset_decimators();
+}
+
 void asha_audio_init()
 {
     memset(enc_ring_buff, 0, sizeof(enc_ring_buff));
+    memset(&enc_work_buff, 0, sizeof(enc_work_buff));
+    initialize_ring();
     pcm_streaming = false;
     encode_audio = false;
     encode_mono = false;
+    reset_stream_requested = false;
+    stream_ready = false;
     write_index = 0u;
+    vol_m = ASHA_USB_VOL_MIN;
     vol_l = ASHA_USB_VOL_MIN;
     vol_r = ASHA_USB_VOL_MIN;
     g_offset = 1;
@@ -92,8 +149,22 @@ void asha_audio_init()
 
 uint32_t asha_audio_get_write_index()
 {
-    uint32_t wi = write_index;
-    return wi;
+    return atomic_load(&write_index);
+}
+
+void asha_audio_start_stream()
+{
+    // Publish not-ready before requesting the reset. A packet that was already
+    // being encoded on the other core may finish, but consumers will not use
+    // it; the producer invalidates it on the next audio callback.
+    atomic_store(&stream_ready, false);
+    atomic_store(&reset_stream_requested, true);
+    atomic_store(&encode_audio, true);
+}
+
+bool asha_audio_stream_ready()
+{
+    return atomic_load(&stream_ready);
 }
 
 void asha_audio_encode_1ms_pcm(struct PCMStereoSample *samples, uint16_t count)
@@ -101,11 +172,17 @@ void asha_audio_encode_1ms_pcm(struct PCMStereoSample *samples, uint16_t count)
 #ifdef PICO_ASHA_ENC_STATS
     absolute_time_t start_time = get_absolute_time();
 #endif
-    bool enc_audio = encode_audio;
-    uint32_t w_index = write_index;
+    if (atomic_exchange(&reset_stream_requested, false)) {
+        reset_stream_state();
+        atomic_store(&stream_ready, atomic_load(&encode_audio));
+    }
+
+    bool enc_audio = atomic_load(&encode_audio);
     if (!enc_audio) return;
+    if (count != ASHA_PCM_PACKET_SIZE && count != ASHA_PCM_MAX_SAMPLES) return;
+    uint32_t w_index = atomic_load(&write_index);
     int buff_index = 0;
-    struct AshaAudioEncBuffer* buff = &enc_ring_buff[ring_buff_index(w_index)];
+    struct AshaAudioEncBuffer* buff = &enc_work_buff;
 
     // Separate interleaved stereo samples to separate channels
     bool mono = encode_mono;
@@ -128,9 +205,7 @@ void asha_audio_encode_1ms_pcm(struct PCMStereoSample *samples, uint16_t count)
     int16_t* pcm_r = NULL;
     if (count == ASHA_PCM_MAX_SAMPLES) {
         arm_fir_decimate_fast_q15(&fir_s_l, pcm_buff_l, pcm_buff_16khz_l, ASHA_BLOCK_SIZE);
-        if (!mono) {
-            arm_fir_decimate_fast_q15(&fir_s_r, pcm_buff_r, pcm_buff_16khz_r, ASHA_BLOCK_SIZE);
-        }
+        arm_fir_decimate_fast_q15(&fir_s_r, pcm_buff_r, pcm_buff_16khz_r, ASHA_BLOCK_SIZE);
         pcm_l = pcm_buff_16khz_l;
         pcm_r = pcm_buff_16khz_r;
     } else {
@@ -139,11 +214,11 @@ void asha_audio_encode_1ms_pcm(struct PCMStereoSample *samples, uint16_t count)
     }
 
     g722_encode(&enc_state_l, buff->l + g_offset, pcm_l, ASHA_PCM_PACKET_SIZE);
-    if (mono) {
-        memcpy(buff->r + g_offset, buff->l + g_offset, ASHA_G722_1MS_SIZE_BYTES);
-    } else {
-        g722_encode(&enc_state_r, buff->r + g_offset, pcm_r, ASHA_PCM_PACKET_SIZE);
-    }
+    // Keep both codec histories advancing even for mono. If one side of a
+    // binaural set disconnects mid-stream, the surviving side can switch to a
+    // mono mix without receiving bytes from the other encoder's history.
+    g722_encode(&enc_state_r, buff->r + g_offset, mono ? pcm_l : pcm_r,
+                ASHA_PCM_PACKET_SIZE);
     
     g_offset += ASHA_G722_1MS_SIZE_BYTES;
 #ifdef PICO_ASHA_ENC_STATS
@@ -155,22 +230,60 @@ void asha_audio_encode_1ms_pcm(struct PCMStereoSample *samples, uint16_t count)
         buff->l[0] = seq_num;
         buff->r[0] = seq_num;
         ++seq_num;
+
+        struct AshaAudioEncBuffer* ring_slot = &enc_ring_buff[ring_buff_index(w_index)];
+        lock_ring_slot(ring_slot);
+        memcpy(ring_slot->l, buff->l, ASHA_SDU_SIZE_BYTES);
+        memcpy(ring_slot->r, buff->r, ASHA_SDU_SIZE_BYTES);
+#ifdef PICO_ASHA_ENC_STATS
+        memcpy(ring_slot->encode_times, buff->encode_times, sizeof(ring_slot->encode_times));
+#endif
+        atomic_store(&ring_slot->published_index, w_index);
+        unlock_ring_slot(ring_slot);
+
         g_offset = 1;
-        write_index += 1;
+        atomic_store(&write_index, w_index + 1u);
         enc_time_index = 0;
     }
 }
 
-uint8_t* asha_audio_get_encoded_at_index(enum AshaAudioSide side, uint32_t index)
+bool asha_audio_copy_encoded_at_index(enum AshaAudioSide side,
+                                      uint32_t index,
+                                      uint8_t* destination,
+                                      uint16_t destination_size)
 {
+    if (destination == NULL || destination_size < ASHA_SDU_SIZE_BYTES) {
+        return false;
+    }
+
     struct AshaAudioEncBuffer* buff = &enc_ring_buff[ring_buff_index(index)];
-    return side == AudioLeft ? buff->l : buff->r;
+    lock_ring_slot(buff);
+    bool available = atomic_load(&buff->published_index) == index;
+    if (available) {
+        const uint8_t* source = side == AudioLeft ? buff->l : buff->r;
+        memcpy(destination, source, ASHA_SDU_SIZE_BYTES);
+    }
+    unlock_ring_slot(buff);
+    return available;
 }
 
 #ifdef PICO_ASHA_ENC_STATS
-int16_t* asha_audio_get_encoding_time_at_index(uint32_t index)
+bool asha_audio_copy_encoding_times_at_index(uint32_t index,
+                                             int16_t* destination,
+                                             uint16_t count)
 {
-    return (&enc_ring_buff[ring_buff_index(index)])->encode_times;
+    if (destination == NULL || count < 20u) {
+        return false;
+    }
+
+    struct AshaAudioEncBuffer* buff = &enc_ring_buff[ring_buff_index(index)];
+    lock_ring_slot(buff);
+    bool available = atomic_load(&buff->published_index) == index;
+    if (available) {
+        memcpy(destination, buff->encode_times, sizeof(buff->encode_times));
+    }
+    unlock_ring_slot(buff);
+    return available;
 }
 #endif
 
@@ -199,13 +312,15 @@ int16_t asha_audio_get_curr_usb_vol(enum AshaAudioSide side)
 
 void asha_audio_set_encoding_enabled(bool enabled)
 {
-    encode_audio = enabled;
+    atomic_store(&encode_audio, enabled);
+    if (!enabled) {
+        atomic_store(&stream_ready, false);
+    }
 }
 
 bool asha_audio_get_encoding_enabled()
 {
-    bool enabled = encode_audio;
-    return enabled;
+    return atomic_load(&encode_audio);
 }
 
 void asha_audio_set_encode_mono(bool mono)
