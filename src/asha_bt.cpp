@@ -43,6 +43,13 @@ static btstack_packet_callback_registration_t sm_event_cb_reg;
 
 static gatt_client_notification_t notification_listener = {};
 
+// CYW43439 Set_Transmit_Power vendor command. Handle 0x00FD selects the
+// default power for future LE connections.
+static const hci_cmd_t cyw43_set_default_le_tx_power = {
+    HCI_OPCODE(0x3Fu, 0x026u), "H1"
+};
+static constexpr uint16_t cyw43_default_le_power_handle = 0x00FDu;
+
 static void hci_event_handler(PACKET_HANDLER_PARAMS);
 
 
@@ -194,6 +201,17 @@ static void process_serial_cmds()
                     }
                 }
                 break;
+            case Command::BLESettings:
+                {
+                    int8_t tx_power_dbm = cmd_pkt.data.ble_settings.tx_power_dbm;
+                    if (!is_valid_ble_tx_power(tx_power_dbm)) {
+                        cmd_pkt.cmd_status = CmdStatus::CmdError;
+                    } else if (tx_power_dbm != runtime_settings.get_ble_tx_power_dbm()) {
+                        RuntimeSettings::defer_ble_tx_power_dbm(tx_power_dbm);
+                        watchdog_enable(10, true);
+                    }
+                }
+                break;
             default:
                 cmd_pkt.cmd_status = CmdStatus::CmdError;
                 break;
@@ -277,6 +295,9 @@ static void hci_event_handler(PACKET_HANDLER_PARAMS)
             if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
                 led_mgr.set_led_pattern(none_connected);
                 add_bonded_to_fal();
+                hci_send_cmd(&cyw43_set_default_le_tx_power,
+                             cyw43_default_le_power_handle,
+                             runtime_settings.get_ble_tx_power_dbm());
                 // Set connection parameters including connection interval
                 // by default. Values taken from Android
                 gap_set_connection_parameters(0x0030, 0x0030, asha_conn_interval, asha_conn_interval, asha_conn_latency, 100, 12, 12);

@@ -92,6 +92,7 @@ public slots:
     void onCmdStreamingEnabledBtnClicked(bool enabled);
     void onCmdRemoveBondBtnClicked();
     void onUsbSettingsBtnClicked(asha::comm::USBInfo const& usb_info);
+    void onBleSettingsBtnClicked(asha::comm::BLEInfo const& ble_info);
     void onPairWithAddress(QByteArray const& addr, uint8_t addr_type);
 };
 

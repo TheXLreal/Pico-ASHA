@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdarg>
 #include <cstdint>
 
 namespace asha
@@ -8,6 +9,18 @@ namespace asha
 namespace comm
 {
     constexpr uint16_t unset_conn_id = 0;
+
+    constexpr int8_t ble_tx_power_min_dbm = -16;
+    constexpr int8_t ble_tx_power_max_dbm = 8;
+    constexpr int8_t ble_tx_power_step_dbm = 4;
+    constexpr int8_t ble_tx_power_default_dbm = ble_tx_power_max_dbm;
+
+    constexpr bool is_valid_ble_tx_power(int8_t tx_power_dbm)
+    {
+        return tx_power_dbm >= ble_tx_power_min_dbm
+            && tx_power_dbm <= ble_tx_power_max_dbm
+            && (tx_power_dbm % ble_tx_power_step_dbm) == 0;
+    }
 
     namespace IntroFlags {
         // Allowed: bit 1, disallowed: bit 0
@@ -30,6 +43,7 @@ namespace comm
         Cmd,
         Advert,
         USBInfo,
+        BLEInfo,
     };
 
     enum class StatusType : uint8_t
@@ -109,6 +123,7 @@ namespace comm
         IntroPacket,
         PairBond,
         USBSettings,
+        BLESettings,
     };
 
     enum class CmdStatus : uint8_t
@@ -165,6 +180,16 @@ namespace comm
     };
 
     static_assert(sizeof(USBInfo) == 8);
+
+    struct BLEInfo
+    {
+        int8_t tx_power_dbm;
+        uint8_t reserved[7];
+
+        bool operator==(const BLEInfo&) const = default;
+    };
+
+    static_assert(sizeof(BLEInfo) == 8);
 
     struct RemoteInfo
     {
@@ -253,6 +278,7 @@ namespace comm
                 uint8_t reserved[3];
             } pair_bond;
             USBInfo usb_settings;
+            BLEInfo ble_settings;
         } data;
     };
 
@@ -283,6 +309,7 @@ namespace comm
 
     void send_intro_packet(int8_t num_connections, uint16_t flags = 0x00);
     void send_usb_info_packet(USBInfo const& usb_info);
+    void send_ble_info_packet(BLEInfo const& ble_info);
     void send_remote_info_packet(RemoteInfo const& remote_info);
     void send_advertising_packet(AdvertisingPacket const& ad_packet);
 

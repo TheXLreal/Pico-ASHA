@@ -41,6 +41,7 @@ PicoAshaComm::PicoAshaComm(QObject *parent)
     QObject::connect(m_ui, &PicoAshaMainWindow::cmdStreamingEnabledBtnClicked, this, &PicoAshaComm::onCmdStreamingEnabledBtnClicked);
     QObject::connect(m_ui, &PicoAshaMainWindow::cmdRemoveBondBtnClicked, this, &PicoAshaComm::onCmdRemoveBondBtnClicked);
     QObject::connect(m_ui, &PicoAshaMainWindow::usbSettingsBtnClicked, this, &PicoAshaComm::onUsbSettingsBtnClicked);
+    QObject::connect(m_ui, &PicoAshaMainWindow::bleSettingsBtnClicked, this, &PicoAshaComm::onBleSettingsBtnClicked);
     QObject::connect(m_ui, &PicoAshaMainWindow::pairWithAddress, this, &PicoAshaComm::onPairWithAddress);
 
     connect_timer.start(timer_interval);
@@ -266,6 +267,21 @@ void PicoAshaComm::onUsbSettingsBtnClicked(const asha::comm::USBInfo &usb_info)
     }
 }
 
+void PicoAshaComm::onBleSettingsBtnClicked(const asha::comm::BLEInfo& ble_info)
+{
+    using namespace asha::comm;
+    bool res = sendCommandPacket(
+        {
+            .cmd = Command::BLESettings,
+            .cmd_status = CmdStatus::CmdOk,
+            .data = {.ble_settings = ble_info}
+        }
+    );
+    if (res) {
+        m_ui->setBLEInfo(ble_info);
+    }
+}
+
 void PicoAshaComm::onPairWithAddress(const QByteArray &addr, uint8_t addr_type)
 {
     using namespace asha::comm;
@@ -344,6 +360,17 @@ void PicoAshaComm::handleDecodedData(QByteArray const& decoded)
         m_ui->setUSBInfo(usb_info);
         m_ui->setUSBWidgetsEnabled(true);
         break;
+    case Type::BLEInfo: {
+        BLEInfo ble_info;
+        if (!assert_packet_size(decoded.size(), "BLEInfo", ble_info)) {
+            return;
+        }
+        memcpy(&ble_info, decoded.constData() + sizeof header, sizeof ble_info);
+        qDebug() << "Got BLEInfo packet, TX power:" << ble_info.tx_power_dbm << "dBm";
+        m_ui->setBLEInfo(ble_info);
+        m_ui->setBLEWidgetsEnabled(true);
+        break;
+    }
     case Type::Event: {
         EventPacket pkt(EventType::ShortLog);
         if (!assert_packet_size(decoded.size(), "EventPacket", pkt)) {

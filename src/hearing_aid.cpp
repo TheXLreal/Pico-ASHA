@@ -243,6 +243,7 @@ void HearingAid::on_serial_host_connected()
         .reserved = 0
     };
     send_usb_info_packet(usb_info);
+    send_ble_info_packet(BLEInfo{.tx_power_dbm = runtime_settings.get_ble_tx_power_dbm()});
     for (auto ha : hearing_aids) {
         if (!ha->is_connected()) {
             continue;

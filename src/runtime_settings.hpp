@@ -7,6 +7,7 @@
 #include <btstack_tlv.h>
 
 #include "asha_audio.h"
+#include "asha_comms.hpp"
 #include "usb_common.hpp"
 
 namespace asha
@@ -26,10 +27,12 @@ struct RuntimeSettings
     bool get_hci_dump_enabled();
     bool get_full_set_paired();
     USBSettings get_usb_settings();
+    int8_t get_ble_tx_power_dbm();
 
     bool set_hci_dump_enabled(bool is_enabled);
     bool set_full_set_paired(bool have_full_set);
     bool set_usb_settings(USBSettings const& settings);
+    bool set_ble_tx_power_dbm(int8_t tx_power_dbm);
 
     // Store a pending setting in watchdog scratch registers so it can be
     // written to TLV after the watchdog reboot, avoiding a race between the
@@ -37,6 +40,7 @@ struct RuntimeSettings
     // before watchdog_enable().
     static void defer_hci_dump(bool enabled);
     static void defer_usb_settings(USBSettings const& settings);
+    static void defer_ble_tx_power_dbm(int8_t tx_power_dbm);
 
     explicit operator bool();
 
@@ -45,6 +49,7 @@ private:
         HCIDump = str_to_tag("PAHC"),
         FullSetPaired = str_to_tag("PAFS"),
         USBSetting = str_to_tag("PAUS"),
+        BLETxPower = str_to_tag("PABT"),
     };
 
     // used to store remote device in TLV
@@ -56,6 +61,7 @@ private:
     bool hci_dump_enabled = false;
     bool full_set_paired = false;
     USBSettings usb_settings = {};
+    int8_t ble_tx_power_dbm = comm::ble_tx_power_default_dbm;
 
     mutex_t mtx = {};
 

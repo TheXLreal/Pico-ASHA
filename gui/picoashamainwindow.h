@@ -38,12 +38,15 @@ public:
 
     void setCmdBtnsEnabled(bool enabled);
     void setUSBWidgetsEnabled(bool enabled);
+    void setBLEWidgetsEnabled(bool enabled);
 
     void setPicoAshaVerStr(QString const& version);
     void setConnectionsAllowed(bool allowed);
     void setAudioStreamingEnabled(bool enabled);
     void setUSBInfo(asha::comm::USBInfo const& usb_info);
+    void setBLEInfo(asha::comm::BLEInfo const& ble_info);
     void setUSBSettingsBtnState();
+    void setBLESettingsBtnState();
 
     void setHciActionBtnStart(bool enabled);
     void setHciActionBtnStop(bool enabled);
@@ -63,6 +66,7 @@ signals:
     void cmdStreamingEnabledBtnClicked(bool enabled);
     void cmdRemoveBondBtnClicked();
     void usbSettingsBtnClicked(asha::comm::USBInfo const& usb_info);
+    void bleSettingsBtnClicked(asha::comm::BLEInfo const& ble_info);
     void pairWithAddress(QByteArray const& addr, uint8_t addr_type);
 
 private:
@@ -84,6 +88,9 @@ private:
     QSpinBox*    m_USBVolMaxSpin;
     QPushButton* m_USBSettingsBtn;
 
+    QComboBox*   m_BLETxPowerCombo;
+    QPushButton* m_BLESettingsBtn;
+
     QPushButton* m_hciActionBtn;
     QPushButton* m_hciPathBtn;
     QLabel* m_hciPathLbl;
@@ -95,7 +102,9 @@ private:
     bool m_streamingEnabled;
 
     asha::comm::USBInfo m_usbInfo;
+    asha::comm::BLEInfo m_bleInfo;
     asha::comm::USBInfo fromUsbWidgets();
+    asha::comm::BLEInfo fromBleWidgets();
 };
 
 #endif // PICOASHAMAINWINDOW_H

@@ -109,6 +109,30 @@ PicoAshaMainWindow::PicoAshaMainWindow(QWidget *parent)
     usbGroup->setLayout(usbLayout);
     mainVBox->addWidget(usbGroup);
 
+    auto bleGroup = new QGroupBox("Bluetooth Settings");
+    auto bleLayout = new QHBoxLayout;
+    bleLayout->addStretch();
+
+    auto bleTxPowerLabel = new QLabel("BLE TX Power");
+    bleLayout->addWidget(bleTxPowerLabel);
+    m_BLETxPowerCombo = new QComboBox();
+    for (int txPower = asha::comm::ble_tx_power_min_dbm;
+         txPower <= asha::comm::ble_tx_power_max_dbm;
+         txPower += asha::comm::ble_tx_power_step_dbm) {
+        m_BLETxPowerCombo->addItem(QString("%1 dBm").arg(txPower), txPower);
+    }
+    m_BLETxPowerCombo->setToolTip("Set the Bluetooth LE transmit power.\n"
+                                  "Higher values can improve range, but increase power consumption.\n"
+                                  "The setting is saved on Pico-ASHA and applied after restart.");
+    bleLayout->addWidget(m_BLETxPowerCombo);
+
+    m_BLESettingsBtn = new QPushButton("Update");
+    bleLayout->addWidget(m_BLESettingsBtn);
+
+    bleLayout->addStretch();
+    bleGroup->setLayout(bleLayout);
+    mainVBox->addWidget(bleGroup);
+
 
     QObject::connect(m_cmdRestartBtn, &QPushButton::clicked, this, &PicoAshaMainWindow::cmdRestartBtnClicked);
     QObject::connect(m_cmdConnAllowedBtn, &QPushButton::clicked, this, [=, this](bool clicked) {
@@ -135,11 +159,18 @@ PicoAshaMainWindow::PicoAshaMainWindow(QWidget *parent)
     QObject::connect(m_USBSettingsBtn, &QPushButton::clicked, this, [=, this](bool clicked) {
         emit usbSettingsBtnClicked(fromUsbWidgets());
     });
+    QObject::connect(m_BLETxPowerCombo, &QComboBox::currentIndexChanged, this, [=, this](int index) {
+        setBLESettingsBtnState();
+    });
+    QObject::connect(m_BLESettingsBtn, &QPushButton::clicked, this, [=, this](bool clicked) {
+        emit bleSettingsBtnClicked(fromBleWidgets());
+    });
 
     setConnectionsAllowed(false);
     setAudioStreamingEnabled(false);
     setCmdBtnsEnabled(false);
     setUSBWidgetsEnabled(false);
+    setBLEWidgetsEnabled(false);
 
     auto hciGroup = new QGroupBox("HCI Logging");
     auto hciLayout = new QHBoxLayout;
@@ -340,6 +371,21 @@ void PicoAshaMainWindow::setUSBSettingsBtnState()
     }
 }
 
+void PicoAshaMainWindow::setBLEInfo(const asha::comm::BLEInfo& ble_info)
+{
+    m_bleInfo = ble_info;
+    int index = m_BLETxPowerCombo->findData(m_bleInfo.tx_power_dbm);
+    if (index >= 0) {
+        m_BLETxPowerCombo->setCurrentIndex(index);
+    }
+    setBLESettingsBtnState();
+}
+
+void PicoAshaMainWindow::setBLESettingsBtnState()
+{
+    m_BLESettingsBtn->setEnabled(m_bleInfo != fromBleWidgets());
+}
+
 void PicoAshaMainWindow::setHciActionBtnStart(bool enabled)
 {
     m_hciActionBtn->setText("HCI Start");
@@ -392,6 +438,11 @@ asha::comm::USBInfo PicoAshaMainWindow::fromUsbWidgets()
     return {.uac_vers = uac_ver, .min_vol = min_vol, .max_vol = max_vol, .reserved = 0U};
 }
 
+asha::comm::BLEInfo PicoAshaMainWindow::fromBleWidgets()
+{
+    return {.tx_power_dbm = static_cast<int8_t>(m_BLETxPowerCombo->currentData().toInt())};
+}
+
 void PicoAshaMainWindow::onSerialConnected(bool connected)
 {
     m_serialConnected = connected;
@@ -419,6 +470,14 @@ void PicoAshaMainWindow::setUSBWidgetsEnabled(bool enabled)
     m_USBVolMaxSpin->setEnabled(enabled);
     if (!enabled) {
         m_USBSettingsBtn->setEnabled(enabled);
+    }
+}
+
+void PicoAshaMainWindow::setBLEWidgetsEnabled(bool enabled)
+{
+    m_BLETxPowerCombo->setEnabled(enabled);
+    if (!enabled) {
+        m_BLESettingsBtn->setEnabled(false);
     }
 }
 

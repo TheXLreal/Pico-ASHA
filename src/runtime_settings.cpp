@@ -13,9 +13,11 @@ namespace asha
 // USB settings: scratch[1] bits  0-13 = (min_vol - ASHA_USB_VOL_MIN),
 //               scratch[1] bits 14-27 = (max_vol - ASHA_USB_VOL_MIN),
 //               scratch[1] bit  28    = (uac_version - 1).
+// BLE TX power: scratch[1] bits 0-7 = signed TX power in dBm.
 // Scratch registers survive a watchdog reset but clear on power-on reset.
 static constexpr uint32_t SCRATCH_CMD_HCI_DUMP     = 0x41534801u; // 'A','S','H',1
 static constexpr uint32_t SCRATCH_CMD_USB_SETTINGS = 0x41534802u; // 'A','S','H',2
+static constexpr uint32_t SCRATCH_CMD_BLE_TX_POWER = 0x41534803u; // 'A','S','H',3
 
 void RuntimeSettings::init()
 {
@@ -50,6 +52,14 @@ USBSettings RuntimeSettings::get_usb_settings()
     return settings;
 }
 
+int8_t RuntimeSettings::get_ble_tx_power_dbm()
+{
+    mutex_enter_blocking(&mtx);
+    int8_t tx_power_dbm = ble_tx_power_dbm;
+    mutex_exit(&mtx);
+    return tx_power_dbm;
+}
+
 RuntimeSettings::operator bool()
 {
     mutex_enter_blocking(&mtx);
@@ -74,6 +84,10 @@ void RuntimeSettings::get_settings()
         if (!usb_settings) {
             usb_settings = USBSettings();
         }
+    }
+    if (!get_tlv_tag(Tag::BLETxPower, ble_tx_power_dbm)
+        || !comm::is_valid_ble_tx_power(ble_tx_power_dbm)) {
+        ble_tx_power_dbm = comm::ble_tx_power_default_dbm;
     }
     got_settings = true;
 }
@@ -114,6 +128,22 @@ bool RuntimeSettings::set_usb_settings(USBSettings const &settings)
     return res;
 }
 
+bool RuntimeSettings::set_ble_tx_power_dbm(int8_t tx_power_dbm)
+{
+    if (!comm::is_valid_ble_tx_power(tx_power_dbm)) {
+        return false;
+    }
+
+    bool res = false;
+    mutex_enter_blocking(&mtx);
+    if (ble_tx_power_dbm != tx_power_dbm) {
+        ble_tx_power_dbm = tx_power_dbm;
+        res = store_tlv_tag(Tag::BLETxPower, ble_tx_power_dbm);
+    }
+    mutex_exit(&mtx);
+    return res;
+}
+
 void RuntimeSettings::defer_hci_dump(bool enabled)
 {
     watchdog_hw->scratch[0] = SCRATCH_CMD_HCI_DUMP;
@@ -127,6 +157,12 @@ void RuntimeSettings::defer_usb_settings(USBSettings const& s)
           (uint32_t)(s.min_vol - ASHA_USB_VOL_MIN)          // bits 0-13
         | ((uint32_t)(s.max_vol - ASHA_USB_VOL_MIN) << 14)  // bits 14-27
         | ((uint32_t)(s.uac_version - 1u) << 28);           // bit 28
+}
+
+void RuntimeSettings::defer_ble_tx_power_dbm(int8_t tx_power_dbm)
+{
+    watchdog_hw->scratch[0] = SCRATCH_CMD_BLE_TX_POWER;
+    watchdog_hw->scratch[1] = static_cast<uint8_t>(tx_power_dbm);
 }
 
 // Called from init() after btstack_tlv_get_instance(), before get_settings().
@@ -146,6 +182,13 @@ void RuntimeSettings::apply_pending_scratch()
         s.max_vol     = (int16_t)((p >> 14) & 0x3FFFu) + ASHA_USB_VOL_MIN;
         s.uac_version = (uint16_t)((p >> 28) & 1u) + 1u;
         store_tlv_tag(Tag::USBSetting, s);
+        break;
+    }
+    case SCRATCH_CMD_BLE_TX_POWER: {
+        int8_t tx_power_dbm = static_cast<int8_t>(watchdog_hw->scratch[1] & 0xFFu);
+        if (comm::is_valid_ble_tx_power(tx_power_dbm)) {
+            store_tlv_tag(Tag::BLETxPower, tx_power_dbm);
+        }
         break;
     }
     default:

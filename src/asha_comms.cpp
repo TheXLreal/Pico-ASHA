@@ -137,6 +137,11 @@ namespace comm
         construct_and_send_packet(Type::USBInfo, unset_conn_id, usb_info);
     }
 
+    void send_ble_info_packet(BLEInfo const& ble_info)
+    {
+        construct_and_send_packet(Type::BLEInfo, unset_conn_id, ble_info);
+    }
+
     void send_remote_info_packet(RemoteInfo const& remote_info)
     {
         construct_and_send_packet(Type::RemInfo, unset_conn_id, remote_info);
